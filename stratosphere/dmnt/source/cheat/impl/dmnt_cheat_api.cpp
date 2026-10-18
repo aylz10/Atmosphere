@@ -401,12 +401,27 @@ namespace ams::dmnt::cheat::impl {
                     R_SUCCEED();
                 }
 
-                Result ReadCheatProcessMemory(u64 proc_addr, void *out_data, size_t size) {
+                Result ReadCheatProcessMemory(u64 proc_addr, void* out_data, size_t size) {
                     std::scoped_lock lk(m_cheat_lock);
+                    typedef struct {
+                        u64 address;
+                        char name[200];
+                    } DmntBreakpointResult;
+#define BP_Result (*(DmntBreakpointResult*) out_data)
+#define BP_address proc_addr & 0xFFFFFFFFFF
+#define BP_Token proc_addr >> 56  
 
-                    R_TRY(this->EnsureCheatProcess());
+                    if (BP_Token != 0 && size >= sizeof(DmntBreakpointResult)) {
+                        BP_Result.address = BP_address;
+                        sprintf(BP_Result.name, "Good Work Token=%lx",BP_Token);
+                        R_SUCCEED();
+                    }
+                    else {
 
-                    R_RETURN(this->ReadCheatProcessMemoryUnsafe(proc_addr, out_data, size));
+                        R_TRY(this->EnsureCheatProcess());
+
+                        R_RETURN(this->ReadCheatProcessMemoryUnsafe(proc_addr, out_data, size));
+                    };
                 }
 
                 Result WriteCheatProcessMemory(u64 proc_addr, const void *data, size_t size) {
@@ -565,6 +580,25 @@ namespace ams::dmnt::cheat::impl {
                     R_SUCCEED();
                 }
 
+                Result SetMemoryBreakpoint(u64 address) {
+                    //                     typedef struct {
+                    //                         bool success;
+                    //                         u64 address;
+                    //                         char name[200];
+                    //                     } DmntMemoryBreakpoint;
+                    // #define BKresult101 ((DmntMemoryBreakpoint) address)
+                    // // implementation details TBD
+
+                    //                     BKresult101.success  = true;
+
+                    //                     sprintf(BKresult101.name, "hello world address = %10lx",BKresult101.address);
+                    if (address == 0x1234) {
+                        R_SUCCEED();
+                    }
+                    else
+                        R_RETURN(1);
+                }
+
                 Result ReadStaticRegister(u64 *out, size_t which) {
                     std::scoped_lock lk(m_cheat_lock);
 
@@ -628,7 +662,10 @@ namespace ams::dmnt::cheat::impl {
 
                 Result GetFrozenAddress(FrozenAddressEntry *frz_addr, u64 address) {
                     std::scoped_lock lk(m_cheat_lock);
-
+                    
+                    if (address == 0x12345) {
+                        frz_addr->address = 0x195432122;
+                    } else {
                     R_TRY(this->EnsureCheatProcess());
 
                     const auto it = m_frozen_addresses_map.find_key(address);
@@ -636,6 +673,7 @@ namespace ams::dmnt::cheat::impl {
 
                     frz_addr->address = it->GetAddress();
                     frz_addr->value   = it->GetValue();
+                    };
                     R_SUCCEED();
                 }
 
@@ -1282,6 +1320,10 @@ namespace ams::dmnt::cheat::impl {
 
     Result SetMasterCheat(const CheatDefinition &def) {
         R_RETURN(GetReference(g_cheat_process_manager).SetMasterCheat(def));
+    }
+
+    Result SetMemoryBreakpoint(u64 address) {
+        R_RETURN(GetReference(g_cheat_process_manager).SetMemoryBreakpoint(address));
     }
 
     Result ReadStaticRegister(u64 *out, size_t which) {

@@ -14,13 +14,540 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include <stratosphere.hpp>
+#if !defined(DMNT_GEN2_NO_CHEATVM)
+#include "cheat/impl/dmnt_cheat_api.hpp"
+#endif
 #include "dmnt2_debug_log.hpp"
 #include "dmnt2_gdb_server_impl.hpp"
+#include "dmnt2_shared_debug_handle.hpp"
 
 namespace ams::dmnt {
 
-    namespace {
+        m_watch_data_t m_watch_data;
+        static_assert(__builtin_offsetof(m_watch_data_t, bp_filter_flags) == GEN2_SAVED_SIZE);
+        /* Protects m_watch_data and the capture-time fields of fromU/count/
+         * total_trigger/next_pc/failed against the three concurrent writers:
+         *   - cheat:cht IPC handlers Get/SetGen2WatchData (Breeze, bookmark.ovl)
+         *   - the gen2_loop() polling thread (GdbServerThreadFunction2)
+         *   - ProcessDebugEvents (capture path)
+         * Pre-mutex, two of these regularly raced; see design doc Bug 3 / Opt 3.
+         */
+        constinit os::SdkMutex g_watch_data_lock;
 
+        /* Signaled by SetGen2WatchData when execute==true. The gen2_loop
+         * polling thread waits on this event with a long timeout (so it
+         * still periodically refreshes the `attached / gen2loop_on` mirror
+         * fields) instead of busy-polling every 50 ms. See design doc Opt 1.
+         */
+        os::Event g_gen2_request_event(os::EventClearMode_AutoClear);
+
+        /* Set while a field sweep runs: gen2_loop then ticks often enough to
+         * move the sweep's watchpoints on. */
+        std::atomic<bool> g_gen2_fast_tick = false;
+
+        /* 0 = idle, 1 = IPC client connected, 2 = raw mode (no GDB session
+         * but an external client may be talking via dmnt:cht IPC). This
+         * used to be a member of GdbServerImpl, but it needs to outlive
+         * sessions so external clients can detect us at any time.
+         * See design doc Bug 5 / Opt 2.
+         */
+        constinit u8 g_gen2_server_on = 0;
+
+        /* Break and Trace: whether a hit on the watched address stops the game.
+         * A zero bp_match_pc or bp_match_lr matches any value, so with both zero
+         * every hit breaks (address alone). Call with g_watch_data_lock held. */
+        static bool IsBreakTrigger(const svc::ThreadContext &ctx) {
+            if (!m_watch_data.bp_match_trigger) {
+                return false;
+            }
+            constexpr u64 AddressMask = 0x7FFFFFFFFFULL;
+            const u64 pc = m_watch_data.bp_match_pc & AddressMask;
+            const u64 lr = m_watch_data.bp_match_lr & AddressMask;
+            return (pc == 0 || (ctx.pc & AddressMask) == pc) && (lr == 0 || (ctx.lr & AddressMask) == lr);
+        }
+
+        /* A fresh attach has no watch or breakpoint yet, whatever the client's
+         * copy it sent along says: address != 0 is how clients tell a watch is
+         * set, so a stale one showed a watch that wasn't there. */
+        /* PAUSE / RESUME. dmnt's own pause shares the debug handle and its resume
+         * drains every pending debug event, capture hits included, which crashed
+         * games while a capture ran. Break() only raises a DebuggerBreak event,
+         * which arrives later: a RESUME before it is remembered. */
+        enum class Gen2Pause : u8 { None, Requested, Paused, ResumeRequested };
+        constinit Gen2Pause g_gen2_pause = Gen2Pause::None;
+
+        static void ForgetWatchAfterAttach() {
+            std::scoped_lock lk(g_watch_data_lock);
+            m_watch_data.address = 0;
+            m_watch_data.bp_match_trigger = false;
+            m_watch_data.bp_filter_flags = 0;
+        }
+
+        /* Before a stopped thread runs on (STEP, STEPOVER, CONT), which also sets
+         * the rearm flag: take the watch off where it would fire again at once, so
+         * the thread can get past it. That is the watched instruction under the PC,
+         * or a data watch for a single step (the instruction may be the access).
+         * A step that only ever re-hit it looked like a step that did nothing. */
+        static void LiftWatchForStep(DebugProcess &process, u64 pc, bool single_step) {
+            if (m_watch_data.address == 0) {
+                return;
+            }
+            if (m_watch_data.read || m_watch_data.write) {
+                if (single_step) {
+                    static_cast<void>(process.ClearWatchPoint(m_watch_data.address, m_watch_data.size));
+                }
+            } else if ((pc & 0x7FFFFFFFFFULL) == (m_watch_data.address & 0x7FFFFFFFFFULL)) {
+                static_cast<void>(process.ClearHardwareBreakPoint(m_watch_data.address, m_watch_data.size));
+            }
+        }
+// #include "led.hpp"
+        bool GdbServerImpl::gen2_loop() {
+            /* Note: we acquire+release the watch_data lock around each
+             * field group so that long-blocking operations (Gen2Attach
+             * waits on a 2s condvar timeout, Detach calls into the
+             * cheat-VM) do not starve concurrent IPC clients or the
+             * capture-side ProcessDebugEvents writer. */
+            {
+                std::scoped_lock lk(g_watch_data_lock);
+                m_watch_data.attached = this->HasDebugProcess();
+                /* gen2loop_on:
+                 *   1 = a GDB session is alive
+                 *   2 = raw mode (no GDB session, but accept thread is waiting)
+                 *   0 = idle
+                 * `gen2_server_on` (the GdbServerImpl member) is kept for ABI
+                 * compatibility with older clients but is no longer the source
+                 * of truth - the free-standing g_gen2_server_on is. */
+                m_watch_data.gen2loop_on = m_session.IsValid() ? 1 : g_gen2_server_on;
+
+                if (m_watch_data.attached) {
+                    this->FieldWatchTick();
+                    m_watch_data.bp_hit = (m_debug_process.GetStatus() == DebugProcess::ProcessStatus_DebugBreak);
+                    if (m_watch_data.bp_hit) {
+                        /* Not while a command is pending: the client may have picked
+                         * another thread for it to act on (the thread list). */
+                        if (!m_watch_data.execute) {
+                            m_watch_data.bp_thread_id = m_debug_process.GetLastThreadId();
+                        }
+                        if (!m_watch_data.execute || m_watch_data.command != SETREGS) {
+                            svc::ThreadContext ctx{};
+                            if (R_SUCCEEDED(m_debug_process.GetThreadContext(std::addressof(ctx), m_watch_data.bp_thread_id, svc::ThreadContextFlag_All))) {
+                                m_watch_data.bp_ctx = ctx;
+                                /* bp_addr is where the client wants SETB / CLEARB to
+                                 * act, and it has already written it when a command is
+                                 * pending: overwriting it here set the breakpoint at
+                                 * the PC instead of at the address asked for. */
+                                if (!m_watch_data.execute) {
+                                    m_watch_data.bp_addr = ctx.pc;
+                                }
+                                m_watch_data.bp_original_insn = m_debug_process.GetSoftwareBreakPointOriginalInstruction(ctx.pc);
+                            }
+                        }
+                    } else {
+                        m_watch_data.bp_thread_id = 0;
+                        m_watch_data.bp_original_insn = 0;
+                    }
+
+                    if (m_step_pending && m_watch_data.bp_hit) {
+                        if (m_step_original_pc != 0) {
+                            m_debug_process.SetBreakPoint(m_step_original_pc, 4, false);
+                        }
+                        /* Clear before setting: every step re-arms, and the managers
+                         * take a new slot for an address already set. The copies
+                         * piled up, a hit cleared only one, and every later step
+                         * or continue stopped at once on the next copy. */
+                        if (m_watchpoint_rearm_pending) {
+                            m_debug_process.ClearWatchPoint(m_watch_data.address, m_watch_data.size);
+                            m_debug_process.SetWatchPoint(m_watch_data.address, m_watch_data.size, m_watch_data.read, m_watch_data.write);
+                            m_watchpoint_rearm_pending = false;
+                        }
+                        if (m_instruction_rearm_pending) {
+                            m_debug_process.ClearHardwareBreakPoint(m_watch_data.address, m_watch_data.size);
+                            m_debug_process.SetHardwareBreakPoint(m_watch_data.address, m_watch_data.size, false);
+                            m_instruction_rearm_pending = false;
+                        }
+                        m_step_pending = false;
+                        m_step_original_pc = 0;
+                        if (m_continue_after_step) {
+                            m_continue_after_step = false;
+                            m_debug_process.Continue();
+                            m_watch_data.bp_hit = false;
+                        }
+                    }
+                } else {
+                    m_watch_data.bp_hit = false;
+                    m_watch_data.bp_thread_id = 0;
+                    m_watch_data.bp_original_insn = 0;
+                    m_step_pending = false;
+                    m_step_original_pc = 0;
+                    m_watchpoint_rearm_pending = false;
+                    m_instruction_rearm_pending = false;
+                    m_continue_after_step = false;
+                }
+
+                if (!m_watch_data.execute) {
+                    return m_watch_data.gen2loop_on;
+                }
+                m_watch_data.execute = false;
+            }
+
+            /* Dispatch outside the lock for commands that may block
+             * (ATTACH variants call Gen2Attach which waits up to 2s).
+             * The dispatched helpers (setw/clearw/Gen2Attach) take the
+             * lock themselves where they touch shared fields. */
+            switch (m_watch_data.command) {
+                case SETW:
+                    if (m_watch_data.x30_catch_type == EXCLUSIVE_SEARCH) {
+                        std::scoped_lock lk(g_watch_data_lock);
+                        if (!m_watch_data.next_read && !m_watch_data.next_write) break;  // not memeory access catched, not valid data for exclusive search
+
+                        m_watch_data.target_address = m_watch_data.next_address;
+                        m_watch_data.exclusive_search_count = m_watch_data.count;
+                        if ((m_watch_data.read || m_watch_data.write) || (m_watch_data.stack_check_count > 0) || m_watch_data.grab_A || m_watch_data.grab_R) m_watch_data.exclusive_search_from2 = true; else m_watch_data.exclusive_search_from2 = false;
+                        m_watch_data.exclusive_search_target_trigger = 0;
+                        set_next_watch_for_exclusive_search();
+                    } else {
+                        std::scoped_lock lk(g_watch_data_lock);
+                        m_watch_data.total_trigger = 0;
+                        clearw();
+                        m_watch_data.address = m_watch_data.next_address;
+                        m_watch_data.read = m_watch_data.next_read;
+                        m_watch_data.write = m_watch_data.next_write;
+                        setw();
+                    }
+                    break;
+                case CLEARW: {
+                    std::scoped_lock lk(g_watch_data_lock);
+                    clearw();
+                    break;
+                }
+                case DETACH: {
+                    std::scoped_lock lk(g_watch_data_lock);
+                    clearw();
+                    this->CodeWatchClose();
+
+                    m_step_pending = false;
+                    m_watchpoint_rearm_pending = false;
+                    m_instruction_rearm_pending = false;
+                    m_continue_after_step = false;
+                    m_gen2_watch_active = false;
+
+                    m_debug_process.Detach();
+                    g_gen2_pause = Gen2Pause::None;
+
+#if !defined(DMNT_GEN2_NO_CHEATVM)
+                    dmnt::cheat::impl::SuspendDebugEvents(false);
+#endif
+
+                    m_watch_data.next_pc = 0x55AA55AA;
+                    m_watch_data.bp_hit = false;
+                    m_watch_data.intercepted = false;
+                    m_watch_data.attached = false;
+                    m_watch_data.attach_success = false;
+                    break;
+                }
+                case ATTACH:
+                    /* The HasDebugProcess() check + Detach is short
+                     * enough to keep under one lock acquisition, but
+                     * Gen2Attach itself MUST run unlocked - it waits
+                     * on g_event_done_cv for up to 2 seconds. */
+                    {
+                        std::scoped_lock lk(g_watch_data_lock);
+                        if (this->HasDebugProcess() && m_process_id != os::ProcessId{m_watch_data.next_pid}) {
+                            clearw();
+                            m_debug_process.Detach();
+                        }
+                    }
+                    if (!this->HasDebugProcess()) {
+                        Gen2Attach();
+                        ForgetWatchAfterAttach();
+                        m_fw_active = false;
+                        m_fw_state = FieldWatchState::None;
+                        m_fw_step_pc = 0;
+                        this->WatchTablesAfterAttach();
+                    }
+                    {
+                        std::scoped_lock lk(g_watch_data_lock);
+                        m_watch_data.attach_success = m_debug_process.IsValid() && m_process_id == os::ProcessId{m_watch_data.next_pid};
+                    }
+                    break;
+                case ATTACH_CONT:
+                    {
+                        std::scoped_lock lk(g_watch_data_lock);
+                        if (this->HasDebugProcess() && m_process_id != os::ProcessId{m_watch_data.next_pid}) {
+                            clearw();
+                            m_debug_process.Detach();
+                        }
+                    }
+                    if (!this->HasDebugProcess()) {
+                        Gen2Attach();
+                        ForgetWatchAfterAttach();
+                        m_fw_active = false;
+                        m_fw_state = FieldWatchState::None;
+                        m_fw_step_pc = 0;
+                        this->WatchTablesAfterAttach();
+                    }
+                    {
+                        std::scoped_lock lk(g_watch_data_lock);
+                        m_watch_data.attach_success = m_debug_process.IsValid() && m_process_id == os::ProcessId{m_watch_data.next_pid};
+                        if (m_watch_data.attach_success) {
+                            m_debug_process.Continue();
+                        }
+                    }
+                    break;
+                case CONT:
+                    if (this->HasDebugProcess()) {
+                        u64 thread_id = m_watch_data.bp_thread_id;
+                        if (thread_id == 0 || thread_id == static_cast<u64>(-1)) {
+                            thread_id = m_debug_process.GetLastThreadId();
+                        }
+                        svc::ThreadContext ctx;
+                        bool has_bp = false;
+                        bool has_ctx = false;
+                        if (thread_id != 0 && R_SUCCEEDED(m_debug_process.GetThreadContext(std::addressof(ctx), thread_id, svc::ThreadContextFlag_Control))) {
+                            has_bp = m_debug_process.HasSoftwareBreakPoint(ctx.pc);
+                            has_ctx = true;
+                        }
+                        const bool has_wp = m_watch_data.bp_hit && m_watch_data.address != 0 && (m_watch_data.read || m_watch_data.write);
+                        const bool has_ib = m_watch_data.bp_hit && m_watch_data.address != 0 && !m_watch_data.read && !m_watch_data.write;
+                        if (has_bp) {
+                            m_debug_process.ClearBreakPoint(ctx.pc, 4);
+                            m_step_pending = true;
+                            m_step_original_pc = ctx.pc;
+                            m_continue_after_step = true;
+                            m_debug_process.Step(thread_id);
+                            m_debug_process.Continue(thread_id);
+                        } else if (has_wp) {
+                            m_step_pending = true;
+                            m_watchpoint_rearm_pending = true;
+                            m_continue_after_step = true;
+                            if (has_ctx) {
+                                LiftWatchForStep(m_debug_process, ctx.pc, true);
+                            }
+                            m_debug_process.Step(thread_id);
+                            m_debug_process.Continue(thread_id);
+                        } else if (has_ib) {
+                            m_step_pending = true;
+                            m_instruction_rearm_pending = true;
+                            m_continue_after_step = true;
+                            if (has_ctx) {
+                                LiftWatchForStep(m_debug_process, ctx.pc, true);
+                            }
+                            m_debug_process.Step(thread_id);
+                            m_debug_process.Continue(thread_id);
+                        } else {
+                            if (m_watch_data.address != 0) {
+                                if (m_watch_data.read || m_watch_data.write) {
+                                    m_debug_process.SetWatchPoint(m_watch_data.address, m_watch_data.size, m_watch_data.read, m_watch_data.write);
+                                } else {
+                                    m_debug_process.SetHardwareBreakPoint(m_watch_data.address, m_watch_data.size, false);
+                                }
+                            }
+                            m_debug_process.Continue();
+                        }
+                    }
+                    break;
+                case INCPC: {
+                    std::scoped_lock lk(g_watch_data_lock);
+                    m_watch_data.next_pc++;
+                    break;
+                }
+                case SETB: {
+                    std::scoped_lock lk(g_watch_data_lock);
+                    if (this->HasDebugProcess()) {
+                        m_debug_process.SetBreakPoint(m_watch_data.bp_addr & 0x7FFFFFFFFFULL, 4, false);
+                    }
+                    break;
+                }
+                case CLEARB: {
+                    std::scoped_lock lk(g_watch_data_lock);
+                    if (this->HasDebugProcess()) {
+                        m_debug_process.ClearBreakPoint(m_watch_data.bp_addr & 0x7FFFFFFFFFULL, 4);
+                        if (m_step_pending && m_step_original_pc == (m_watch_data.bp_addr & 0x7FFFFFFFFFULL)) {
+                            m_step_pending = false;
+                            m_step_original_pc = 0;
+                        }
+                    }
+                    break;
+                }
+                case STEP: {
+                    std::scoped_lock lk(g_watch_data_lock);
+                    if (this->HasDebugProcess()) {
+                        u64 thread_id = m_watch_data.bp_thread_id;
+                        if (thread_id == 0 || thread_id == static_cast<u64>(-1)) {
+                            thread_id = m_debug_process.GetLastThreadId();
+                        }
+                        if (thread_id != 0) {
+                            svc::ThreadContext ctx;
+                            if (R_SUCCEEDED(m_debug_process.GetThreadContext(std::addressof(ctx), thread_id, svc::ThreadContextFlag_Control))) {
+                                u64 pc = ctx.pc;
+                                bool has_bp = m_debug_process.HasSoftwareBreakPoint(pc);
+                                const bool has_wp = m_watch_data.bp_hit && m_watch_data.address != 0 && (m_watch_data.read || m_watch_data.write);
+                                const bool has_ib = m_watch_data.bp_hit && m_watch_data.address != 0 && !m_watch_data.read && !m_watch_data.write;
+                                if (has_bp) {
+                                    m_debug_process.ClearBreakPoint(pc, 4);
+                                    m_step_pending = true;
+                                    m_step_original_pc = pc;
+                                } else if (has_wp || has_ib) {
+                                    m_step_pending = true;
+                                }
+                                if (m_watch_data.address != 0) {
+                                    if (m_watch_data.read || m_watch_data.write) {
+                                        m_watchpoint_rearm_pending = true;
+                                    } else {
+                                        m_instruction_rearm_pending = true;
+                                    }
+                                }
+                                LiftWatchForStep(m_debug_process, pc, true);
+                                m_continue_after_step = false;
+                                m_debug_process.Step(thread_id);
+                                m_debug_process.Continue(thread_id);
+                            }
+                        }
+                    }
+                    break;
+                }
+                case STEPOVER: {
+                    std::scoped_lock lk(g_watch_data_lock);
+                    if (this->HasDebugProcess()) {
+                        u64 thread_id = m_watch_data.bp_thread_id;
+                        if (thread_id == 0 || thread_id == static_cast<u64>(-1)) {
+                            thread_id = m_debug_process.GetLastThreadId();
+                        }
+                        if (thread_id != 0) {
+                            svc::ThreadContext ctx;
+                            if (R_SUCCEEDED(m_debug_process.GetThreadContext(std::addressof(ctx), thread_id, svc::ThreadContextFlag_Control))) {
+                                u64 pc = ctx.pc;
+                                u32 insn = 0;
+                                m_debug_process.ReadMemory(std::addressof(insn), pc, sizeof(insn));
+                                bool is_call = false;
+                                if ((insn & 0xFC000000) == 0x94000000) { // bl
+                                    is_call = true;
+                                } else if ((insn & 0xFFFFFC1F) == 0xD63F0000) { // blr
+                                    is_call = true;
+                                }
+                                bool has_bp = m_debug_process.HasSoftwareBreakPoint(pc);
+                                const bool has_wp = m_watch_data.bp_hit && m_watch_data.address != 0 && (m_watch_data.read || m_watch_data.write);
+                                const bool has_ib = m_watch_data.bp_hit && m_watch_data.address != 0 && !m_watch_data.read && !m_watch_data.write;
+                                if (has_bp) {
+                                    m_debug_process.ClearBreakPoint(pc, 4);
+                                }
+                                if (m_watch_data.address != 0) {
+                                    if (m_watch_data.read || m_watch_data.write) {
+                                        m_watchpoint_rearm_pending = true;
+                                    } else {
+                                        m_instruction_rearm_pending = true;
+                                    }
+                                }
+                                LiftWatchForStep(m_debug_process, pc, !is_call);
+                                m_continue_after_step = false;
+                                if (is_call) {
+                                    m_debug_process.SetBreakPoint(pc + 4, 4, true); // set step breakpoint
+                                    m_step_pending = true;
+                                    m_step_original_pc = has_bp ? pc : 0;
+                                    m_debug_process.Continue();
+                                } else {
+                                    if (has_bp) {
+                                        m_step_pending = true;
+                                        m_step_original_pc = pc;
+                                    } else if (has_wp || has_ib) {
+                                        m_step_pending = true;
+                                    }
+                                    m_debug_process.Step(thread_id);
+                                    m_debug_process.Continue(thread_id);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                case PAUSE: {
+                    std::scoped_lock lk(g_watch_data_lock);
+                    if (this->HasDebugProcess() && m_debug_process.GetStatus() == DebugProcess::ProcessStatus_Running &&
+                        R_SUCCEEDED(m_debug_process.Break())) {
+                        g_gen2_pause = Gen2Pause::Requested;
+                    }
+                    break;
+                }
+                case RESUME: {
+                    std::scoped_lock lk(g_watch_data_lock);
+                    if (g_gen2_pause == Gen2Pause::Requested) {
+                        g_gen2_pause = Gen2Pause::ResumeRequested;
+                    } else if (g_gen2_pause == Gen2Pause::Paused) {
+                        g_gen2_pause = Gen2Pause::None;
+                        if (this->HasDebugProcess() && m_debug_process.GetStatus() == DebugProcess::ProcessStatus_DebugBreak) {
+                            m_debug_process.Continue();
+                        }
+                    }
+                    break;
+                }
+                case GETTHREADS: {
+                    std::scoped_lock lk(g_watch_data_lock);
+                    m_watch_data.thread_count = 0;
+                    if (this->HasDebugProcess()) {
+                        /* Not on the stack: gen2_loop runs on a small stack and its
+                         * frame holds the locals of every case. Only the lock this
+                         * case already holds guards it. */
+                        static u64 thread_ids[max_thread_list];
+                        s32 count = 0;
+                        m_debug_process.GetThreadList(std::addressof(count), thread_ids, util::size(thread_ids));
+                        for (s32 i = 0; i < count && m_watch_data.thread_count < max_thread_list; i++) {
+                            svc::ThreadContext ctx;
+                            if (R_FAILED(m_debug_process.GetThreadContext(std::addressof(ctx), thread_ids[i], svc::ThreadContextFlag_Control))) {
+                                continue;
+                            }
+                            auto &entry = m_watch_data.threads[m_watch_data.thread_count++];
+                            entry.id = thread_ids[i];
+                            entry.pc = ctx.pc;
+                            entry.lr = ctx.lr;
+                            entry.sp = ctx.sp;
+                            char name[os::ThreadNameLengthMax + 1] = {};
+                            m_debug_process.GetThreadName(name, thread_ids[i]);
+                            std::strncpy(entry.name, name, sizeof(entry.name) - 1);
+                            entry.name[sizeof(entry.name) - 1] = 0;
+                        }
+                    }
+                    break;
+                }
+                case SETREGS: {
+                    std::scoped_lock lk(g_watch_data_lock);
+                    if (this->HasDebugProcess()) {
+                        u64 thread_id = m_watch_data.bp_thread_id;
+                        if (thread_id == 0 || thread_id == static_cast<u64>(-1)) {
+                            thread_id = m_debug_process.GetLastThreadId();
+                        }
+                        if (thread_id != 0) {
+                            Result rc = m_debug_process.SetThreadContext(std::addressof(m_watch_data.bp_ctx), thread_id, svc::ThreadContextFlag_All);
+                            if (R_FAILED(rc)) {
+                                m_watch_data.failed = rc.GetValue();
+                            } else {
+                                m_debug_process.GetThreadContext(std::addressof(m_watch_data.bp_ctx), thread_id, svc::ThreadContextFlag_All);
+                            }
+                        }
+                    }
+                    break;
+                }
+            };
+            {
+                std::scoped_lock lk(g_watch_data_lock);
+                m_watch_data.attached = this->HasDebugProcess();
+                /* bp_hit was computed before the command ran. After CONT, STEP or
+                 * STEPOVER the game runs, and until the next refresh (up to
+                 * Gen2LoopRefreshInterval) a client would see the old stop and
+                 * could not tell the next hit from it. */
+                /* CONT first steps the stopped thread over the re-armed watch; that
+                 * step can finish before this point, and the game is then broken
+                 * only until gen2_loop continues it. Not a stop either: reporting
+                 * it showed the old stop again, and the next real hit looked like
+                 * the same one. */
+                if (m_watch_data.attached) {
+                    m_watch_data.bp_hit = m_debug_process.GetStatus() == DebugProcess::ProcessStatus_DebugBreak &&
+                                          !(m_step_pending && m_continue_after_step);
+                }
+                m_watch_data.done = true;
+                return m_watch_data.gen2loop_on;
+            }
+        }
+    namespace {
         constexpr const u32 SdkBreakPoint     = 0xE7FFFFFF;
         constexpr const u32 SdkBreakPointMask = 0xFFFFFFFF;
 
@@ -371,6 +898,22 @@ namespace ams::dmnt {
                 if (int v = DecodeHex(c); v >= 0) {
                     value <<= 4;
                     value |= v & 0xF;
+                } else {
+                    break;
+                }
+            }
+
+            return value;
+        }
+
+        constexpr u64 DecodeDec(const char *s) {
+            u64 value = 0;
+
+            while (true) {
+                const char c = *(s++);
+
+                if (int v = DecodeHex(c); v >= 0) {
+                    value = v + value*10;
                 } else {
                     break;
                 }
@@ -853,8 +1396,89 @@ namespace ams::dmnt {
         constinit os::SdkConditionVariable g_event_request_cv;
         constinit os::SdkConditionVariable g_event_done_cv;
 
-    }
+        /* Predicate flags for the Gen2Attach <-> DebugEventsThread
+         * condvar handshake. These exist because the original
+         * handshake had a real lost-signal race:
+         *
+         *   - DebugEventsThread waits on g_event_request_cv with
+         *     g_event_lock held.
+         *   - Gen2Attach signaled g_event_request_cv while holding a
+         *     DIFFERENT mutex (g_event_request_lock).
+         *
+         * Because the two sides used different mutexes there was no
+         * synchronization between "is the waiter ready to receive"
+         * and "the signal happens", so the signal could be dropped if
+         * Gen2Attach ran before the waiter reached Wait(). The
+         * symptom is "ATTACH from Breeze times out and stays broken
+         * until something (IDA GDB connect, sleep/wake) happens that
+         * causes a fresh DebugEventsThread to enter Wait() between
+         * the next Gen2Attach calls".
+         *
+         * The fix is the standard condvar pattern: same mutex on
+         * both sides, predicate flag, while-loop on the predicate.
+         *
+         * Set by Gen2Attach when posting an attach request, cleared
+         * by DebugEventsThread when it picks the request up.
+         */
+        constinit bool g_attach_request_pending = false;
+        /* Set by DebugEventsThread when it has finished an attach
+         * (success or failure); cleared by Gen2Attach after it
+         * observes done. */
+        constinit bool g_attach_done = false;
 
+    }
+    void GdbServerImpl::Gen2Attach() {
+#if !defined(DMNT_GEN2_NO_CHEATVM)
+        dmnt::cheat::impl::SuspendDebugEvents(true);
+#endif
+        /* Set our process id. */
+        m_process_id = {m_watch_data.next_pid};
+
+        /* Post the attach request under the same mutex the
+         * DebugEventsThread waits on, with a predicate flag so a
+         * signal cannot be lost even if the waiter isn't blocked yet.
+         * See g_attach_request_pending comment above. */
+        std::scoped_lock lk(g_event_lock);
+        g_attach_done            = false;
+        g_attach_request_pending = true;
+        g_event_request_cv.Signal();
+
+        /* Wait for the worker to report done (success or failure).
+         * Loop because condvars can spuriously wake. Total budget
+         * 2 s, matching the original timeout. */
+        const auto start = os::GetSystemTick();
+        const auto budget = TimeSpan::FromSeconds(2);
+        while (!g_attach_done) {
+            const auto elapsed = os::ConvertToTimeSpan(os::GetSystemTick() - start);
+            if (elapsed >= budget) {
+                break;
+            }
+            const auto remaining = budget - elapsed;
+            /* TimedWait atomically releases g_event_lock; on return
+             * we hold it again. */
+            (void)g_event_done_cv.TimedWait(g_event_lock, remaining);
+        }
+        /* Reset pending in case the worker hasn't picked it up
+         * (e.g. on timeout) so a future request isn't double-consumed. */
+        g_attach_request_pending = false;
+
+#if !defined(DMNT_GEN2_NO_CHEATVM)
+        /* If we did not end up attached -- the worker failed, or we timed out
+         * before it ran at all -- undo the suspend we latched on entry.
+         *
+         * DebugProcess::Attach() has its own guard, but it only covers the
+         * case where the worker actually reached Attach(). The 2 s timeout
+         * path never does, and a latched suspend leaves the cheat engine's
+         * events thread parked: any later ForceOpenCheatProcess() re-attaches
+         * with svcDebugActiveProcess and nothing ever continues the game.
+         * This is the "Unable to attach to game, you may need to toggle sleep"
+         * path in Breeze's gen2 menu. */
+        if (!m_debug_process.IsValid()) {
+            dmnt::cheat::impl::SuspendDebugEvents(false);
+            dmnt::cheat::impl::ForceOpenCheatProcess();
+        }
+#endif
+    }
     GdbServerImpl::GdbServerImpl(int socket, void *stack, size_t stack_size) : m_socket(socket), m_session(socket), m_packet_io(), m_state(State::Initial), m_debug_process(), m_event(os::EventClearMode_AutoClear) {
         /* Create and start the events thread. */
         R_ABORT_UNLESS(os::CreateThread(std::addressof(m_events_thread), DebugEventsThreadEntry, this, stack, stack_size, os::HighestThreadPriority - 1));
@@ -868,9 +1492,13 @@ namespace ams::dmnt {
         /* Set ourselves as killed. */
         m_killed = true;
 
-        /* Signal to our events thread. */
+        /* Wake the events thread so it observes m_killed and exits
+         * its predicate-loop. Must signal under g_event_lock (the
+         * same mutex the waiter uses) - the old code signaled under
+         * g_event_request_lock which had no relationship to the
+         * waiter and was a race. */
         {
-            std::scoped_lock lk(g_event_request_lock);
+            std::scoped_lock lk(g_event_lock);
             g_event_request_cv.Signal();
         }
 
@@ -884,10 +1512,42 @@ namespace ams::dmnt {
         /* Clear our state. */
         m_state = State::Destroyed;
 
-        /* Detach. */
+        /* Detach. This object goes whenever the listening socket does - the
+         * console going to sleep is enough - and a method or code watch may
+         * be armed: its breaks are in the game's code, and with this object
+         * goes the only record of what was under them. Take them off first,
+         * as a detach asked for by the client does. */
         if (this->HasDebugProcess()) {
+            std::scoped_lock lk(g_watch_data_lock);
+            if (m_mw_active) {
+                this->MethodWatchClear();
+            }
+            if (m_cw_active) {
+                this->CodeWatchDisarm();
+            }
+            this->CodeWatchClose();
+            m_watch_data.address  = 0;
+            m_watch_data.attached = false;
             m_debug_process.Detach();
         }
+
+#if !defined(DMNT_GEN2_NO_CHEATVM)
+        /* Un-park the cheat engine's events thread only now that we are done
+         * with the debug handle.
+         *
+         * This used to run at the very top of the destructor, which meant that
+         * for the whole teardown - joining the events thread, clearing
+         * breakpoints, the Continue() inside Detach() - both we and the cheat
+         * events thread owned the same shared handle and could race for the
+         * same debug event. Harmless in outcome (the process ends up running
+         * either way) but it is exactly the double-ownership the parked
+         * acknowledgement exists to prevent.
+         *
+         * Detach() already does this when it had a valid process; repeating it
+         * is free and covers the case where it did not (a Gen2Attach that
+         * latched the suspend and then failed). */
+        dmnt::cheat::impl::SuspendDebugEvents(false);
+#endif
     }
 
     void GdbServerImpl::DebugEventsThread() {
@@ -897,16 +1557,25 @@ namespace ams::dmnt {
 
             /* Loop while we're not killed. */
             while (!m_killed) {
-                /* Wait for a request to come in. */
-                g_event_request_cv.Wait(g_event_lock);
+                /* Wait for an attach request to come in. Predicate
+                 * loop so a signal that arrived before we reached
+                 * Wait() is still observed (Gen2Attach sets
+                 * g_attach_request_pending under the same lock before
+                 * signaling). See g_attach_request_pending comment. */
+                while (!m_killed && !g_attach_request_pending) {
+                    g_event_request_cv.Wait(g_event_lock);
+                }
 
                 /* Check that we're not killed now. */
                 if (m_killed) {
                     break;
                 }
 
+                /* Consume the request. */
+                g_attach_request_pending = false;
+
                 /* Detach. */
-                m_debug_process.Detach();
+                this->DetachWithWatchBreaksOff();
 
                 /* Check if we need to start the process. */
                 const bool start_process = m_process_id == m_wait_process_id;
@@ -917,6 +1586,9 @@ namespace ams::dmnt {
                     /* If we have a process id, attach. */
                     if (R_FAILED(m_debug_process.Attach(m_process_id, m_process_id == m_wait_process_id))) {
                         AMS_DMNT2_GDB_LOG_DEBUG("Failed to attach to %016lx\n", m_process_id.value);
+                        /* Report done (failed) and loop back to wait
+                         * for the next request. */
+                        g_attach_done = true;
                         g_event_done_cv.Signal();
                         continue;
                     }
@@ -925,7 +1597,50 @@ namespace ams::dmnt {
                 /* Set our process id. */
                 m_process_id = m_debug_process.GetProcessId();
 
+                /* Default m_watch_data.main_start/main_end to the
+                 * attached process's main NSO .text range.
+                 *
+                 * gen2's capture-side maths (return-address scanning
+                 * in get_from_stack, x30/lr offset encoding in
+                 * ProcessDebugEvents) requires these be set; if a
+                 * client forgets, capture produces garbage addresses
+                 * that the client then dereferences, often crashing
+                 * the debugged process or the client itself. Breeze
+                 * sets them in its gen2_menu execute path; for a
+                 * while bookmark.ovl did not, which is what triggered
+                 * gen2fork_design_and_review.md addendum 11.
+                 *
+                 * We default here unconditionally on every fresh
+                 * attach because:
+                 *  - The previous attach's main_start is stale for a
+                 *    new process; carrying it over is always wrong.
+                 *  - gen2_loop's ATTACH path no-ops if HasDebugProcess
+                 *    matches the requested pid, so this code only
+                 *    runs on a real (re)attach to a different
+                 *    process.
+                 *  - Clients that want a custom value (e.g. Breeze
+                 *    using m_mainBaseAddr + m_R1 for an offset into
+                 *    the code region) override these fields on each
+                 *    subsequent SETW, after attach completes.
+                 *
+                 * CollectModules() ran inside m_debug_process.Attach()
+                 * above, so module 0 is the main NSO's first
+                 * ReadExecute region (matches Breeze's
+                 * dmntchtQueryCheatProcessMemory(main_base) result).
+                 */
+                if (m_debug_process.GetModuleCount() > 0) {
+                    std::scoped_lock wd_lk(g_watch_data_lock);
+                    const size_t main_ix    = m_debug_process.GetMainModuleIndex();
+                    const u64    main_base  = m_debug_process.GetModuleBaseAddress(main_ix);
+                    const u64    main_size  = m_debug_process.GetModuleSize(main_ix);
+                    m_watch_data.main_start = main_base;
+                    m_watch_data.main_end   = main_base + main_size;
+                    AMS_DMNT2_GDB_LOG_DEBUG("Defaulted main_start=%lx main_end=%lx\n",
+                                            m_watch_data.main_start, m_watch_data.main_end);
+                }
+
                 /* Signal that we're done attaching. */
+                g_attach_done = true;
                 g_event_done_cv.Signal();
 
                 /* Process debug events without the lock held. */
@@ -935,14 +1650,170 @@ namespace ams::dmnt {
                     g_event_lock.Lock();
                 }
 
-                /* Clear our process id and detach. */
+                /* Detach, then clear our process id. This is the way out when
+                 * the object is being destroyed (m_killed): the destructor
+                 * finds no debug process left by the time it looks. */
+                this->DetachWithWatchBreaksOff();
                 m_process_id = os::InvalidProcessId;
-                m_debug_process.Detach();
             }
         }
 
         /* Set our state. */
         m_state = State::Exited;
+    }
+    void GdbServerImpl::set_next_watch_for_exclusive_search() {
+        if (m_watch_data.exclusive_search_count == 0) {
+            clearw();
+            return;
+        }
+        m_watch_data.total_trigger = 0;
+        clearw();
+        if (m_watch_data.exclusive_search_from2) {
+            m_watch_data.address = m_watch_data.fromU.from3[0].address;
+            m_watch_data.i = m_watch_data.fromU.from3[0].i;
+            m_watch_data.j = m_watch_data.fromU.from3[0].j;
+            m_watch_data.k = m_watch_data.fromU.from3[0].k;
+            m_watch_data.two_register = m_watch_data.fromU.from3[0].two_register;
+            m_watch_data.offset = m_watch_data.fromU.from3[0].offset;
+        } else {
+            m_watch_data.address = m_watch_data.fromU.from1[0].address;
+            m_watch_data.i = m_watch_data.fromU.from1[0].i;
+            m_watch_data.j = m_watch_data.fromU.from1[0].j;
+            m_watch_data.k = m_watch_data.fromU.from1[0].k;
+            m_watch_data.two_register = m_watch_data.fromU.from1[0].two_register;
+            m_watch_data.offset = m_watch_data.fromU.from1[0].offset;
+        }
+        memcpy(&(m_watch_data.v1),&(m_watch_data.fromU.from3[0].stack[0]),16);
+        m_watch_data.next_address = m_watch_data.address; // for debug purpose also need to get i,j,k
+        m_watch_data.next_read = false;
+        m_watch_data.next_write = false;
+        m_watch_data.read = false;
+        m_watch_data.write = false;
+        setw();
+        return;
+    };
+    m_from_stack_t GdbServerImpl::get_from_stack(svc::ThreadContext &thread_context, bool get_address = true) {
+        u64 buffer[stack_check_size];
+        m_from_stack_t m_from_stack = {0};
+        auto index = 0;
+        if (m_watch_data.stack_check_count > 0) {
+            svc::MemoryInfo meminfo;
+            int check_size = stack_check_size;
+
+            /* Opt 4: read only as much stack as we plausibly need. Each
+             * matched return address typically lives within the first
+             * few qwords of a call frame, so 4 qwords per requested
+             * stack_check_count is a sensible upper bound. Capped to
+             * `stack_check_size` (100 qwords) and floored at 8 so very
+             * small requests still get a useful window. If the small
+             * read doesn't find enough matches we fall back to the full
+             * 100-qword read below. */
+            const int small_size = std::min<int>(stack_check_size,
+                                                 std::max<int>(8, m_watch_data.stack_check_count * 4));
+            bool need_full_read = false;
+            if (R_FAILED(m_debug_process.ReadMemory(buffer, thread_context.sp, small_size * sizeof(u64)))) {
+                /* Read at sp failed - either we crossed a page boundary
+                 * or the stack is unmapped here. Fall back to the
+                 * original "query then clamp" path. */
+                if (R_SUCCEEDED(m_debug_process.QueryMemory(&meminfo, thread_context.sp))) {
+                    check_size = (meminfo.base_address + meminfo.size - thread_context.sp) / sizeof(u64);
+                }
+                if (R_FAILED(m_debug_process.ReadMemory(buffer, thread_context.sp, check_size * sizeof(u64)))) {
+                    check_size = 0;
+                }
+            } else {
+                check_size = small_size;
+            }
+
+            int scanned = 0;
+            for (; scanned < check_size && index < m_watch_data.stack_check_count; scanned++) {
+                if ((m_watch_data.main_start <= buffer[scanned]) && (buffer[scanned] < m_watch_data.main_end)) {
+                    m_from_stack.stack[index].code_offset = ((buffer[scanned] - m_watch_data.main_start) & 0x7FFFFFF) >> 2;
+                    m_from_stack.stack[index].SP_offset = scanned;
+                    index++;
+                };
+            }
+
+            /* Didn't find enough matches in the small window; read the
+             * rest of the stack and continue scanning. */
+            if (index < m_watch_data.stack_check_count && check_size == small_size && small_size < stack_check_size) {
+                need_full_read = true;
+            }
+            if (need_full_read) {
+                const int remaining = stack_check_size - small_size;
+                if (R_SUCCEEDED(m_debug_process.ReadMemory(buffer + small_size,
+                                                            thread_context.sp + small_size * sizeof(u64),
+                                                            remaining * sizeof(u64)))) {
+                    for (int i = small_size; i < stack_check_size && index < m_watch_data.stack_check_count; i++) {
+                        if ((m_watch_data.main_start <= buffer[i]) && (buffer[i] < m_watch_data.main_end)) {
+                            m_from_stack.stack[index].code_offset = ((buffer[i] - m_watch_data.main_start) & 0x7FFFFFF) >> 2;
+                            m_from_stack.stack[index].SP_offset = i;
+                            index++;
+                        }
+                    }
+                }
+            }
+        };
+        if (m_watch_data.stack_check_count < max_call_stack) {
+            if (m_watch_data.grab_A) {
+            index = m_watch_data.stack_check_count;
+            m_debug_process.ReadMemory(&(m_from_stack.stack[index]), m_watch_data.grab_A_address, (max_call_stack - index) * sizeof(call_stack_t));
+            } else if ((m_watch_data.grab_R)&&(m_watch_data.stack_check_count < max_call_stack - 1)) {
+                memcpy(&(m_from_stack.stack[index]), &(thread_context.r[m_watch_data.Register]), std::min((size_t)8,(max_call_stack - index) * sizeof(call_stack_t)));
+            };
+        }
+        if (get_address)
+        switch (m_watch_data.x30_catch_type) {
+            case OFFSET:
+                m_from_stack.address = thread_context.pc | ((thread_context.lr - m_watch_data.main_start) << (64 - 27));
+                break;
+            case STACK: {
+                u64 value;
+                if (R_FAILED(m_debug_process.ReadMemory(&value, thread_context.sp + m_watch_data.caller_SP_offset * 8, sizeof(value)))) {
+                    m_watch_data.failed = 11;
+                    m_from_stack.address = thread_context.pc;
+                    break;
+                };
+                m_from_stack.address = thread_context.pc | (((value - m_watch_data.main_start) & (-4)) << (64 - 27));
+                break;
+            }
+            default:
+                m_from_stack.address = thread_context.pc;
+                break;
+        };
+        return m_from_stack;
+    };
+    /* The Break and Trace filter: rebuild the row a capture with the same
+     * settings would record for this hit (the call site in the top 25 bits of
+     * its address, the return addresses found on the stack) and compare the
+     * parts the client chose. Call with g_watch_data_lock held. */
+    bool GdbServerImpl::BreakFilterMatches(svc::ThreadContext &thread_context) {
+        const u32 flags = m_watch_data.bp_filter_flags;
+        if (flags == 0) {
+            return true;
+        }
+        if ((flags & BP_FILTER_REGISTER) != 0) {
+            const u8 reg = m_watch_data.Register;
+            const u64 value = reg < 29 ? thread_context.r[reg] : reg == 29 ? thread_context.fp : reg == 30 ? thread_context.lr : thread_context.sp;
+            if (value != m_watch_data.Register_match_value) {
+                return false;
+            }
+            /* The stack is only read when a part of it has to match too. */
+            if ((flags & ~BP_FILTER_REGISTER) == 0) {
+                return true;
+            }
+        }
+        const m_from_stack_t entry = get_from_stack(thread_context, true);
+        if ((flags & BP_FILTER_X30) != 0 && static_cast<u32>((entry.address >> 39) & 0x1FFFFFF) != m_watch_data.bp_filter_call_from) {
+            return false;
+        }
+        for (int slot = 0; slot < max_call_stack; slot++) {
+            if ((flags & BP_FILTER_STACK(slot)) != 0 &&
+                std::memcmp(&entry.stack[slot], &m_watch_data.bp_filter_stack[slot], sizeof(call_stack_t)) != 0) {
+                return false;
+            }
+        }
+        return true;
     }
 
     void GdbServerImpl::ProcessDebugEvents() {
@@ -950,6 +1821,31 @@ namespace ams::dmnt {
 
         u64 new_hb_nro_addr = 0;
         u32 new_hb_nro_insn = 0;
+
+        auto CheckRateLimitAndSleep = []() {
+            static os::Tick s_period_start;
+            static bool s_initialized = false;
+            static u32 s_event_count = 0;
+
+            os::Tick now = os::GetSystemTick();
+            if (!s_initialized) {
+                s_period_start = now;
+                s_initialized = true;
+            }
+
+            const auto elapsed = os::ConvertToTimeSpan(now - s_period_start);
+            if (elapsed < TimeSpan::FromMilliSeconds(1)) {
+                s_event_count++;
+                if (s_event_count > 10) {
+                    os::SleepThread(TimeSpan::FromMilliSeconds(1));
+                    s_period_start = os::GetSystemTick();
+                    s_event_count = 0;
+                }
+            } else {
+                s_period_start = now;
+                s_event_count = 1;
+            }
+        };
 
         while (true) {
             /* Wait for an event to come in. */
@@ -981,6 +1877,7 @@ namespace ams::dmnt {
             GdbSignal signal;
             char send_buffer[GdbPacketBufferSize];
             u64 thread_id = d.thread_id;
+            const bool was_stepping = m_debug_process.IsStepping();
             m_debug_process.ClearStep();
 
             char *       reply_cur = send_buffer;
@@ -993,17 +1890,270 @@ namespace ams::dmnt {
                         switch (d.info.exception.type) {
                             case svc::DebugException_BreakPoint:
                                 {
-                                    signal = GdbSignal_BreakpointTrap;
+                                    /* All capture-side updates below mutate m_watch_data
+                                     * (intercepted/next_pc/failed/fromU/count/total_trigger).
+                                     * Lock against the gen2_loop poll thread and the
+                                     * dmnt:cht IPC handlers for the duration. See Opt 3. */
+                                    std::unique_lock _wd_lk(g_watch_data_lock);
 
+                                    signal = GdbSignal_BreakpointTrap;
                                     const uintptr_t address = d.info.exception.address;
                                     const bool is_instr     = d.info.exception.specific.break_point.type == svc::BreakPointType_HardwareInstruction;
-                                    AMS_DMNT2_GDB_LOG_DEBUG("BreakPoint %lx, addr=%lx, type=%s\n", thread_id, address, is_instr ? "Instr" : "Data");
+                                    const bool is_watchpoint = d.info.exception.specific.break_point.type == svc::BreakPointType_HardwareData;
+                                    AMS_DMNT2_GDB_LOG_DEBUG("BreakPoint %lx, addr=%lx, type=%s\n", thread_id, address, is_instr ? "Instr" : (is_watchpoint ? "Data" : "Software/Step"));
 
-                                    if (is_instr) {
-                                        AppendReplyFormat(reply_cur, reply_end, "T%02Xthread:p%lx.%lx;hwbreak:;", static_cast<u32>(signal), m_process_id.value, thread_id);
+                                    if ((!is_instr && !is_watchpoint) || was_stepping) {
+                                         m_watch_data.intercepted = true;
+                                         /* The step CONT takes over a re-armed breakpoint is not a
+                                          * stop: gen2_loop continues the game straight away, and a
+                                          * client polling in between must not see bp_hit. */
+                                         m_watch_data.bp_hit = !(m_step_pending && m_continue_after_step);
+                                         /* A step over a call stops on a temporary breakpoint after
+                                          * it. Left in place it showed as the instruction there,
+                                          * and the next step made it a permanent one. */
+                                         if (!was_stepping) {
+                                             m_debug_process.ClearStepBreakPoints();
+                                         }
+                                         m_debug_process.SetDebugBreaked();
+                                         m_watch_data.bp_thread_id = thread_id;
+                                         svc::ThreadContext thread_context;
+                                         if (R_SUCCEEDED(m_debug_process.GetThreadContext(std::addressof(thread_context), thread_id, svc::ThreadContextFlag_All))) {
+                                             m_watch_data.bp_ctx = thread_context;
+                                             m_watch_data.bp_addr = thread_context.pc;
+                                             m_watch_data.bp_original_insn = m_debug_process.GetSoftwareBreakPointOriginalInstruction(thread_context.pc);
+                                         }
+                                         if (m_session.IsValid()) {
+                                             AppendReplyFormat(reply_cur, reply_end, "T%02Xthread:p%lx.%lx;", static_cast<u32>(signal), m_process_id.value, thread_id);
+                                         }
+                                         if (m_step_pending && m_continue_after_step) {
+                                             g_gen2_request_event.Signal();
+                                         }
+                                     } else if (is_instr) {
+                                        if (m_fw_step_pc != 0 && address == m_fw_step_pc) {
+                                            this->FieldWatchOnStep(thread_id);
+                                            _wd_lk.unlock();
+                                            m_debug_process.Continue();
+                                            break;
+                                        }
+                                        if (address == m_watch_data.next_pc || address == m_watch_data.address) {
+                                            m_watch_data.intercepted = true;
+                                            if (R_FAILED(m_debug_process.ClearHardwareBreakPoint(address, (address == m_watch_data.next_pc) ? 4 : m_watch_data.size))) {
+                                                m_watch_data.failed = 5;
+                                            } else {
+                                                if (!m_watch_data.read && !m_watch_data.write) {
+                                                    /* instructin case*/
+                                                    if (address == m_watch_data.next_pc) {
+                                                        if (R_FAILED(m_debug_process.SetHardwareBreakPoint(m_watch_data.address, m_watch_data.size, false))) { 
+                                                            m_watch_data.failed = 6;
+                                                        }
+                                                        m_debug_process.Continue();
+                                                    } else {
+                                                        /* do data collection*/
+                                                        svc::ThreadContext thread_context;
+                                                        // u64 buffer[stack_check_size];
+                                                        // auto Check_CALLSTACK = [&]() {
+                                                        //     // if (m_watch_data.stack_check_count > 0 && false) {
+                                                        //     //     m_debug_process.ReadMemory(buffer, thread_context.sp, stack_check_size * sizeof(u64));
+                                                        //     //     for (int i = 0; i < m_watch_data.stack_check_count; i++) {
+                                                        //     //         if (((m_watch_data.call_stack[i].code_offset) << 2) + m_watch_data.main_start != buffer[m_watch_data.call_stack[i].SP_offset]) return false;
+                                                        //     //     }
+                                                        //     // }
+                                                        //     return true;
+                                                        // };
+                                                        if (R_SUCCEEDED(m_debug_process.GetThreadContext(std::addressof(thread_context), thread_id, svc::ThreadContextFlag_All))) {
+                                                            const bool is_trigger_bp = IsBreakTrigger(thread_context) && BreakFilterMatches(thread_context);
+
+                                                            if (is_trigger_bp) {
+                                                                m_watch_data.bp_hit = true;
+                                                                m_debug_process.SetDebugBreaked();
+                                                                m_watch_data.bp_thread_id = thread_id;
+                                                                m_watch_data.bp_ctx = thread_context;
+                                                                m_watch_data.bp_addr = thread_context.pc;
+                                                                m_watch_data.bp_original_insn = 0;
+                                                            } else if (m_watch_data.bp_match_trigger) {
+                                                                m_watch_data.next_pc = thread_context.pc + 4;
+                                                                if (R_FAILED(m_debug_process.SetHardwareBreakPoint(m_watch_data.next_pc, 4, false))) {
+                                                                    m_watch_data.failed = 7;
+                                                                }
+                                                                _wd_lk.unlock();
+                                                                CheckRateLimitAndSleep();
+                                                                m_debug_process.Continue();
+                                                            } else {
+                                                                u64 X30_alternative;
+                                                                switch (m_watch_data.x30_catch_type) {
+                                                                    case OFFSET:
+                                                                        X30_alternative = (thread_context.lr);
+                                                                        break;
+                                                                    case STACK:
+                                                                        if (R_FAILED(m_debug_process.ReadMemory(&X30_alternative, thread_context.sp + m_watch_data.caller_SP_offset*8, sizeof(X30_alternative)))) {
+                                                                            m_watch_data.failed = 8;
+                                                                            X30_alternative = 0;
+                                                                        };
+                                                                        X30_alternative = X30_alternative & (-4);
+                                                                        break;
+                                                                    default:
+                                                                        X30_alternative = m_watch_data.main_start;
+                                                                        break;
+                                                                };
+#define FROM_U(i) (m_watch_data.fromU.from3[i])
+#define Match_U(i) ((FROM_U(i).x30_offset == x30_catch) && (memcmp(&(FROM_U(i).stack[0]), &(entry.stack[0]), sizeof(call_stack_t) * m_watch_data.stack_check_count) == 0))
+#define IS_CURRENT_ADDRESS(i) (FROM_U(i).address == m_watch_data.address)
+
+                                                                if (m_watch_data.x30_catch_type == EXCLUSIVE_SEARCH) {
+                                                                    u64 target_address = (thread_context.r[m_watch_data.i] + (m_watch_data.two_register ? (thread_context.r[m_watch_data.j] << m_watch_data.k) : m_watch_data.offset));
+                                                                    if (m_watch_data.target_address != target_address) {
+                                                                        u32 x30_catch = (thread_context.lr - m_watch_data.main_start) >> 2;
+                                                                        auto entry = get_from_stack(thread_context,false);
+                                                                        u32 index = 0;
+                                                                        while (index < m_watch_data.exclusive_search_count && IS_CURRENT_ADDRESS(index)) {
+                                                                            if (Match_U(index)) {
+                                                                                for (int i = index; i < m_watch_data.exclusive_search_count - 1; i++)
+                                                                                    memcpy(&FROM_U(i), &FROM_U(i + 1), sizeof(m_from3_t));
+                                                                                m_watch_data.exclusive_search_count--;
+                                                                                if (m_watch_data.exclusive_search_count != 0 && FROM_U(0).address != m_watch_data.address) {
+                                                                                    set_next_watch_for_exclusive_search();
+                                                                                } else if (m_watch_data.exclusive_search_count == 0) {
+                                                                                    clearw();
+                                                                                }
+                                                                            }
+                                                                            index++;
+                                                                        }
+                                                                    } else {
+                                                                        m_watch_data.count = m_watch_data.exclusive_search_count;
+                                                                        u32 x30_catch = (thread_context.lr - m_watch_data.main_start) >> 2;
+                                                                        auto entry = get_from_stack(thread_context, false);
+                                                                        if Match_U (0)
+                                                                            m_watch_data.exclusive_search_target_trigger++;
+                                                                    }
+                                                                } else if ((m_watch_data.check_x30 == false) || ((X30_alternative & 0xFFFF) == m_watch_data.x30_match) || (m_watch_data.x30_catch_type == R_MATCH && thread_context.r[m_watch_data.Register] == m_watch_data.Register_match_value)) {
+                                                                    u64 ret_Rvalue = (thread_context.r[m_watch_data.i] + (m_watch_data.two_register ? (thread_context.r[m_watch_data.j] << m_watch_data.k) : 0)) | ((X30_alternative - m_watch_data.main_start) << (64 - 27));
+                                                                    bool found = false;
+                                                                    if ((m_watch_data.stack_check_count > 0) || m_watch_data.grab_A || m_watch_data.grab_R) {
+                                                                        auto entry = get_from_stack(thread_context,false);
+                                                                        entry.address = ret_Rvalue;
+                                                                        for (int i = 0; i < m_watch_data.count; i++) {
+                                                                            if (memcmp(&(m_watch_data.fromU.from2[i].from_stack), &entry, sizeof(m_from_stack_t)) == 0) {
+                                                                                (m_watch_data.fromU.from2[i].count)++;
+                                                                                found = true;
+                                                                            }
+                                                                        };
+                                                                        if (!found && m_watch_data.count < max_watch_buffer2) {
+                                                                            u64 value = 0;
+                                                                            if (m_watch_data.range_check) {
+                                                                                u64 address = thread_context.r[m_watch_data.i] + m_watch_data.offset;
+                                                                                if (R_FAILED(m_debug_process.ReadMemory(&value, address, m_watch_data.vsize))) {
+                                                                                    m_watch_data.failed = 9;
+                                                                                };
+                                                                            }
+                                                                            if (!m_watch_data.range_check || (m_watch_data.v1 <= value && value <= m_watch_data.v2)) {
+                                                                                m_watch_data.fromU.from2[m_watch_data.count].from_stack = entry;
+                                                                                m_watch_data.fromU.from2[m_watch_data.count].count = 1;
+                                                                                m_watch_data.count++;
+                                                                            };
+                                                                        }
+                                                                    } else {
+                                                                        for (int i = 0; i < m_watch_data.count; i++) {
+                                                                            if (m_watch_data.fromU.from[i].address == ret_Rvalue) {
+                                                                                (m_watch_data.fromU.from[i].count)++;
+                                                                                found = true;
+                                                                            }
+                                                                        };
+                                                                        if (!found && m_watch_data.count < max_watch_buffer) {
+                                                                            u64 value = 0;
+                                                                            if (m_watch_data.range_check) {
+                                                                                u64 address = thread_context.r[m_watch_data.i] + m_watch_data.offset;
+                                                                                if (R_FAILED(m_debug_process.ReadMemory(&value, address, m_watch_data.vsize))) {
+                                                                                    m_watch_data.failed = 10;
+                                                                                };
+                                                                            }
+                                                                            if (!m_watch_data.range_check || (m_watch_data.v1 <= value && value <= m_watch_data.v2)) {
+                                                                                m_watch_data.fromU.from[m_watch_data.count].address = ret_Rvalue;
+                                                                                m_watch_data.fromU.from[m_watch_data.count].count = 1;
+                                                                                m_watch_data.count++;
+                                                                            };
+                                                                        }
+                                                                    }
+                                                                }
+
+                                                                if (m_watch_data.total_trigger < m_watch_data.max_trigger) {
+                                                                    m_watch_data.total_trigger++;
+                                                                    m_watch_data.next_pc = address + 4;
+                                                                    if (R_FAILED(m_debug_process.SetHardwareBreakPoint(m_watch_data.next_pc, 4, false))) {
+                                                                        m_watch_data.failed = 7;
+                                                                    } 
+                                                                    _wd_lk.unlock();
+                                                                    CheckRateLimitAndSleep();
+                                                                    m_debug_process.Continue();
+                                                                } else {
+                                                                    m_debug_process.Continue();
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
+                                                    /* memory case*/
+                                                    if (R_FAILED(m_debug_process.SetWatchPoint(m_watch_data.address, m_watch_data.size, m_watch_data.read, m_watch_data.write))) {
+                                                        m_watch_data.failed = 4;
+                                                    } 
+                                                        m_debug_process.Continue();  // thread_id);
+                                                }
+                                            }
+                                        } else {
+                                            /* Hardware instruction breakpoint that doesn't match
+                                             * the gen2 watch (`m_watch_data.address`) or its
+                                             * next_pc re-arm slot. Three scenarios reach here:
+                                             *
+                                             *  1. A real GDB client set a `Z1` hardware BP we
+                                             *     don't own; we forward the stop reply.
+                                             *  2. The BP was gen2's next_pc re-arm slot but
+                                             *     CLEARW just zeroed m_watch_data.next_pc
+                                             *     (and m_watch_data.address) so it no longer
+                                             *     matches when this stale fire arrives.
+                                             *  3. The BP was gen2's watched instruction but
+                                             *     CLEARW just zeroed m_watch_data.address.
+                                             *
+                                             * For (2) and (3) the game thread is suspended on a
+                                             * stale gen2 trap; we MUST Continue() or the game
+                                             * hangs (and Switch OS eventually kills it as
+                                             * unresponsive - this manifests as "game crashes
+                                             * when I change the watch", see addendum 14).
+                                             *
+                                             * Detect raw mode (no GDB client) via
+                                             * !m_session.IsValid(). In raw mode the stop reply
+                                             * has no recipient anyway, so just Continue.
+                                             */
+                                            m_watch_data.intercepted = false;
+                                            if (!m_session.IsValid()) {
+                                                m_debug_process.ClearHardwareBreakPoint(address, 4);
+                                                m_debug_process.Continue();
+                                            } else {
+                                                AppendReplyFormat(reply_cur, reply_end, "T%02Xthread:p%lx.%lx;hwbreak:;", static_cast<u32>(signal), m_process_id.value, thread_id);
+                                            }
+                                        }
                                     } else {
+                                        /* FIELD_WATCH owns its blocks, and with no GDB
+                                         * client every data hit there is. */
+                                        if (m_fw_active && (!m_session.IsValid() || this->FieldWatchCovers(address))) {
+                                            const auto resume = this->FieldWatchOnAccess(thread_id, address);
+                                            _wd_lk.unlock();
+                                            CheckRateLimitAndSleep();
+                                            if (resume == FieldWatchResume::Thread) {
+                                                m_debug_process.Continue(thread_id);
+                                            } else {
+                                                m_debug_process.Continue();
+                                            }
+                                            break;
+                                        }
                                         bool read = false, write = false;
                                         const char *type = "watch";
+                                        /* GetWatchPointInfo iterates the active WP slots and
+                                         * returns success iff `address` lies inside one of
+                                         * them. We use it for the GDB protocol's rwatch/
+                                         * awatch type label, but NOT as the gen2 owner
+                                         * check - the kernel can report a fault address
+                                         * that lies outside the configured user range
+                                         * (e.g. for BAS-masked watches it can report the
+                                         * qword-aligned base). */
                                         if (R_SUCCEEDED(m_debug_process.GetWatchPointInfo(address, read, write))) {
                                             if (read && write) {
                                                 type = "awatch";
@@ -1014,8 +2164,130 @@ namespace ams::dmnt {
                                             AMS_DMNT2_GDB_LOG_DEBUG("GetWatchPointInfo FAIL %lx, addr=%lx, type=%s\n", thread_id, address, is_instr ? "Instr" : "Data");
                                         }
 
-                                        AppendReplyFormat(reply_cur, reply_end, "T%02Xthread:p%lx.%lx;%s:%lx;", static_cast<u32>(signal), m_process_id.value, thread_id, type, address);
+                                        /* Decide whether this hit belongs to the gen2
+                                         * capture engine or to a GDB client's Z2/Z3/Z4.
+                                         *
+                                         * Ownership comes from m_gen2_watch_*, NOT from
+                                         * m_watch_data. m_watch_data is a file-scope global
+                                         * that outlives the session and that any dmnt:cht
+                                         * client can overwrite at any moment, so a stale
+                                         * address left there by an earlier Breeze capture
+                                         * used to let gen2 claim - and silently clear - a
+                                         * watchpoint a GDB client had just armed nearby.
+                                         * That failure is invisible from the client side:
+                                         * the watchpoint simply never fires again. The
+                                         * m_gen2_watch_* shadow fields are GdbServerImpl
+                                         * members written only by setw() and cleared only
+                                         * by clearw(), so they mean "the gen2 side of THIS
+                                         * session has a watch armed" and nothing else.
+                                         * See WATCHPOINT_BUG.md, Finding A.
+                                         *
+                                         * The address band stays fuzzy on purpose: ARMv8
+                                         * reports a fault address within the region the
+                                         * access touched, which for a wide access (STP,
+                                         * ST4) can fall outside the watched qword. But it
+                                         * is now only consulted once we already know gen2
+                                         * owns a watch.
+                                         *
+                                         * Raw mode (no GDB session) is read from
+                                         * m_session directly rather than from
+                                         * m_watch_data.gen2loop_on, which is only
+                                         * refreshed by gen2_loop's 500 ms tick and so can
+                                         * still read 2 for up to half a second after a
+                                         * client connects - long enough to claim a hit
+                                         * that belongs to GDB.
+                                         *
+                                         * On ambiguity, favour the GDB client. Guessing
+                                         * gen2 wrongly clears the watchpoint and sends no
+                                         * stop reply, which is silent and expensive;
+                                         * guessing GDB wrongly sends a spurious stop reply,
+                                         * which is visible and harmless.
+                                         */
+                                        const u64 band = std::max<u64>(32, m_gen2_watch_size);
+                                        const u64 our_lo = util::AlignDown(m_gen2_watch_address, band);
+                                        const u64 our_hi = our_lo + band;
+                                        const bool in_band = (m_gen2_watch_size > 0)
+                                            && (address >= our_lo) && (address < our_hi);
+                                        const bool gen2_owns = m_gen2_watch_active
+                                            && (address == m_gen2_watch_address || in_band || !m_session.IsValid());
+
+                                        if (gen2_owns) {
+                                            m_watch_data.intercepted = true;
+                                            /* Clear the watch point */
+                                            if (R_SUCCEEDED(m_debug_process.ClearWatchPoint(m_gen2_watch_address, m_gen2_watch_size))) {
+                                                /* save the info*/
+                                                svc::ThreadContext thread_context;
+                                                if (R_SUCCEEDED(m_debug_process.GetThreadContext(std::addressof(thread_context), thread_id, svc::ThreadContextFlag_All))) {
+
+                                                    const bool is_trigger_bp = IsBreakTrigger(thread_context) && BreakFilterMatches(thread_context);
+
+                                                    if (is_trigger_bp) {
+                                                        m_watch_data.bp_hit = true;
+                                                        m_debug_process.SetDebugBreaked();
+                                                        m_watch_data.bp_thread_id = thread_id;
+                                                        m_watch_data.bp_ctx = thread_context;
+                                                        m_watch_data.bp_addr = thread_context.pc;
+                                                        m_watch_data.bp_original_insn = 0;
+                                                    } else if (m_watch_data.bp_match_trigger) {
+                                                        m_watch_data.next_pc = thread_context.pc + 4;
+                                                        if (R_FAILED(m_debug_process.SetHardwareBreakPoint(m_watch_data.next_pc, 4, false))) {
+                                                            m_watch_data.failed = 2;
+                                                        }
+                                                        _wd_lk.unlock();
+                                                        CheckRateLimitAndSleep();
+                                                        m_debug_process.Continue();
+                                                    } else {
+                                                        // Normal watchpoint hit (monitor mode)
+                                                        bool found = false;
+                                                        auto entry = get_from_stack(thread_context, true);
+                                                        for (int i = 0; i < m_watch_data.count; i++) {
+                                                            if (memcmp(&(m_watch_data.fromU.from2[i].from_stack), &entry, sizeof(m_from_stack_t)) == 0) {
+                                                                (m_watch_data.fromU.from2[i].count)++;
+                                                                found = true;
+                                                            }
+                                                        };
+                                                        if (!found && m_watch_data.count < max_watch_buffer2) {
+                                                            m_watch_data.fromU.from2[m_watch_data.count].from_stack = entry;
+                                                            m_watch_data.fromU.from2[m_watch_data.count].count = 1;
+                                                            m_watch_data.count++;
+                                                        };
+                                                        if (m_watch_data.total_trigger < m_watch_data.max_trigger) {
+                                                            m_watch_data.total_trigger++;
+                                                            m_watch_data.next_pc = thread_context.pc + 4;
+                                                            if (R_FAILED(m_debug_process.SetHardwareBreakPoint(m_watch_data.next_pc, 4, false))) {
+                                                                m_watch_data.failed = 2;
+                                                            };
+                                                            _wd_lk.unlock();
+                                                            CheckRateLimitAndSleep();
+                                                            m_debug_process.Continue();
+                                                        } else {
+                                                            m_debug_process.Continue();
+                                                        }
+                                                    }
+                                                } else
+                                                    m_watch_data.failed = 1;
+                                            } else {
+                                                m_watch_data.failed = 3;
+                                            };;
+                                        } else {
+                                            /* Hardware data watchpoint that doesn't match the
+                                             * gen2 watch band. Same shape as the instruction-BP
+                                             * non-match branch above: in raw mode we must
+                                             * Continue() the suspended game thread, otherwise
+                                             * a stale gen2 WP firing after CLEARW (which zeroed
+                                             * m_watch_data.address) would freeze the game until
+                                             * the OS killed it. See addendum 14.
+                                             */
+                                            m_watch_data.intercepted = false;
+                                            if (!m_session.IsValid()) {
+                                                m_debug_process.ClearWatchPoint(address, 4);
+                                                m_debug_process.Continue();
+                                            } else {
+                                                AppendReplyFormat(reply_cur, reply_end, "T%02Xthread:p%lx.%lx;%s:%lx;", static_cast<u32>(signal), m_process_id.value, thread_id, type, address);
+                                            }
+                                        }
                                     }
+
                                 }
                                 break;
                             case svc::DebugException_UserBreak:
@@ -1087,11 +2359,46 @@ namespace ams::dmnt {
 
                                     m_debug_process.SetLastThreadId(thread_id);
                                     m_debug_process.SetThreadIdOverride(thread_id);
+
+                                    /* The break a PAUSE asked for. */
+                                    {
+                                        std::scoped_lock lk(g_watch_data_lock);
+                                        if (g_gen2_pause == Gen2Pause::ResumeRequested) {
+                                            g_gen2_pause = Gen2Pause::None;
+                                            m_debug_process.Continue();
+                                            continue;
+                                        }
+                                        if (g_gen2_pause == Gen2Pause::Requested) {
+                                            g_gen2_pause = Gen2Pause::Paused;
+                                        }
+                                    }
                                 }
                                 break;
                             case svc::DebugException_UndefinedInstruction:
                                 {
                                     signal            = GdbSignal_IllegalInstruction;
+
+                                    /* A code watch's break: the same, out of the long list. */
+                                    if (m_cw_count != 0) {
+                                        std::unique_lock cw_lk(g_watch_data_lock);
+                                        if (this->CodeWatchOnBreak(thread_id, d.info.exception.address)) {
+                                            cw_lk.unlock();
+                                            CheckRateLimitAndSleep();
+                                            m_debug_process.Continue();
+                                            break;
+                                        }
+                                    }
+
+                                    /* A method watch's break: the instruction is back, run on. */
+                                    if (m_mw_count != 0) {
+                                        std::unique_lock mw_lk(g_watch_data_lock);
+                                        if (this->MethodWatchOnBreak(thread_id, d.info.exception.address)) {
+                                            mw_lk.unlock();
+                                            CheckRateLimitAndSleep();
+                                            m_debug_process.Continue();
+                                            break;
+                                        }
+                                    }
 
                                     uintptr_t address = d.info.exception.address;
                                     const u32 insn    = d.info.exception.specific.undefined_instruction.insn;
@@ -1169,10 +2476,20 @@ namespace ams::dmnt {
                                     }
 
                                     if (signal == GdbSignal_BreakpointTrap && !is_new_hb_nro) {
-                                        AppendReplyFormat(reply_cur, reply_end, "T%02Xthread:p%lx.%lx;swbreak:;", static_cast<u32>(signal), m_process_id.value, thread_id);
+                                        if (m_watch_data.intercepted)
+                                            m_watch_data.intercepted = false;
+                                        else
+                                            AppendReplyFormat(reply_cur, reply_end, "T%02Xthread:p%lx.%lx;swbreak:;", static_cast<u32>(signal), m_process_id.value, thread_id);
                                     }
 
                                     m_debug_process.ClearStep();
+                                    /* Software breakpoints (SdkBreakPoint, 0xE7FFFFFF) arrive here,
+                                     * including the temporary one STEPOVER puts after a call.
+                                     * ClearStep only removes it while single-stepping, so it stayed
+                                     * in the code: the stop showed E7FFFFFF at the PC. */
+                                    if (signal == GdbSignal_BreakpointTrap) {
+                                        m_debug_process.ClearStepBreakPoints();
+                                    }
                                 }
                                 break;
                             default:
@@ -1182,7 +2499,10 @@ namespace ams::dmnt {
                         }
 
                         if (reply_cur == send_buffer) {
-                            AppendReplyFormat(reply_cur, reply_end, "T%02Xthread:p%lx.%lx;", static_cast<u32>(signal), m_process_id.value, thread_id);
+                            if (m_watch_data.intercepted)
+                                m_watch_data.intercepted = false;
+                            else
+                                AppendReplyFormat(reply_cur, reply_end, "T%02Xthread:p%lx.%lx;", static_cast<u32>(signal), m_process_id.value, thread_id);
                         }
 
                         m_debug_process.SetLastThreadId(thread_id);
@@ -1213,7 +2533,6 @@ namespace ams::dmnt {
                     break;
                 case svc::DebugEvent_ExitProcess:
                     {
-                        m_killed = true;
                         AMS_DMNT2_GDB_LOG_DEBUG("ExitProcess\n");
 
                         if (d.info.exit_process.reason == svc::ProcessExitReason_ExitProcess) {
@@ -1222,7 +2541,25 @@ namespace ams::dmnt {
                             AppendReplyFormat(reply_cur, reply_end, "X%02X", GdbSignal_Killed);
                         }
 
+                        /* Tear down the debug-process state in either case. */
                         m_debug_process.Detach();
+
+                        /* Only mark the whole GdbServerImpl as killed when
+                         * there's a real GDB client connected. Otherwise
+                         * (raw mode / IPC-only / dummy) we want the
+                         * DebugEventsThread to fall back to its outer
+                         * wait-for-next-attach loop so the next gen2
+                         * ATTACH from Breeze / bookmark.ovl is serviced.
+                         *
+                         * Without this, the events thread exited the
+                         * moment any debugged game crashed, leaving
+                         * Gen2Attach with no waiter and forcing the
+                         * user to sleep/wake the console to recover.
+                         * See gen2fork_design_and_review.md addendum 9.
+                         */
+                        if (m_session.IsValid()) {
+                            m_killed = true;
+                        }
                     }
                     break;
                 default:
@@ -1290,22 +2627,26 @@ namespace ams::dmnt {
         /* Process packets. */
         while (m_session.IsValid()) {
             /* Receive a packet. */
-            bool do_break = false;
-            char recv_buf[GdbPacketBufferSize];
-            char *packet = this->ReceivePacket(std::addressof(do_break), recv_buf, sizeof(recv_buf));
+            if (m_session.IsValid()) {
+                bool do_break = false;
+                char recv_buf[GdbPacketBufferSize];
+                char *packet = this->ReceivePacket(std::addressof(do_break), recv_buf, sizeof(recv_buf));
 
-            if (!do_break && packet != nullptr) {
-                /* Process the packet. */
-                char reply_buffer[GdbPacketBufferSize];
-                this->ProcessPacket(packet, reply_buffer);
+                if (!do_break && packet != nullptr) {
+                    /* Process the packet. */
+                    char reply_buffer[GdbPacketBufferSize];
+                    this->ProcessPacket(packet, reply_buffer);
 
-                /* Send packet. */
-                this->SendPacket(std::addressof(do_break), reply_buffer);
-            }
+                    /* Send packet. */
+                    this->SendPacket(std::addressof(do_break), reply_buffer);
+                }
 
-            /* If we should, break the process. */
-            if (do_break) {
-                R_DISCARD(m_debug_process.Break());
+                /* If we should, break the process. */
+                if (do_break) {
+                    R_DISCARD(m_debug_process.Break());
+                }
+            } else {
+                os::SleepThread(TimeSpan::FromSeconds(1));
             }
         }
     }
@@ -1386,12 +2727,12 @@ namespace ams::dmnt {
         }
     }
 
-    void GdbServerImpl::D() {
-        m_debug_process.Detach();
+    void GdbServerImpl::D() { // Detach
+        this->DetachWithWatchBreaksOff();
         AppendReplyOk(m_reply_cur, m_reply_end);
     }
 
-    void GdbServerImpl::G() {
+    void GdbServerImpl::G() { // Write Register
         /* Get thread id. */
         u32 thread_id = m_debug_process.GetThreadIdOverride();
         if (thread_id == 0 || thread_id == static_cast<u32>(-1)) {
@@ -1565,7 +2906,7 @@ namespace ams::dmnt {
         }
     }
 
-    void GdbServerImpl::Z() {
+    void GdbServerImpl::Z() { // insert_breakpoint
         /* Increment past the 'Z'. */
         ++m_receive_packet;
 
@@ -1587,6 +2928,7 @@ namespace ams::dmnt {
 
         /* Parse address/length. */
         const u64 address = DecodeHex(m_receive_packet);
+        if (address == m_watch_data.address) m_watch_data.address = 0;
         const u64 length  = DecodeHex(comma + 1);
 
         switch (type) {
@@ -1672,7 +3014,7 @@ namespace ams::dmnt {
         }
     }
 
-    bool GdbServerImpl::g() {
+    bool GdbServerImpl::g() { // Read registers
         /* Get thread id. */
         u64 thread_id = m_debug_process.GetThreadIdOverride();
         if (thread_id == 0 || thread_id == static_cast<u64>(-1)) {
@@ -1766,16 +3108,34 @@ namespace ams::dmnt {
                 /* Set our process id. */
                 m_process_id = { process_id };
 
-                /* Wait for us to be attached. */
+                /* Post the attach request to the events thread.
+                 * Same predicate + same-mutex pattern as Gen2Attach;
+                 * see g_attach_request_pending. */
                 {
-                    std::scoped_lock lk(g_event_request_lock);
+                    std::scoped_lock lk(g_event_lock);
+                    g_attach_done            = false;
+                    g_attach_request_pending = true;
                     g_event_request_cv.Signal();
-                    if (!g_event_done_cv.TimedWait(g_event_request_lock, TimeSpan::FromSeconds(2))) {
-                        m_event.Signal();
+
+                    const auto start  = os::GetSystemTick();
+                    const auto budget = TimeSpan::FromSeconds(2);
+                    while (!g_attach_done) {
+                        const auto elapsed = os::ConvertToTimeSpan(os::GetSystemTick() - start);
+                        if (elapsed >= budget) break;
+                        (void)g_event_done_cv.TimedWait(g_event_lock, budget - elapsed);
                     }
+                    g_attach_request_pending = false;
                 }
 
-                /* If we're attached, send a stop reply packet. */
+                /* If we're attached, send a stop reply packet.
+                 *
+                 * No Break() here: DebugProcess::StartShared() halts the
+                 * process and consumes the DebuggerBreak event itself, so by
+                 * now we are genuinely stopped. Breaking from this side instead
+                 * raced the reply (GetThreadContext on a still-running process)
+                 * and let the event escape to ProcessDebugEvents, which
+                 * answered it with a second asynchronous stop reply on top of
+                 * this one. */
                 if (m_debug_process.IsValid()) {
                     /* Set the stop reply packet. */
                     this->AppendStopReplyPacket(m_debug_process.GetLastSignal());
@@ -1958,6 +3318,1030 @@ namespace ams::dmnt {
         }
     }
 
+    void GdbServerImpl::get_region(u64 address) {
+        m_watch_data.module_name = m_watch_data.name;
+        sprintf(m_watch_data.name, "undefine");
+        m_watch_data.base = 0;
+        m_watch_data.offset = m_watch_data.address;
+
+        /* Binary search the module list for the one containing `address`.
+         * CollectModules() walks the address space low-to-high, so the
+         * module array is already sorted by base address. Modules may
+         * have small gaps (text+rodata then data is a separate region),
+         * so we look for the rightmost module whose base <= address and
+         * then range-check explicitly. See design doc Opt 5.
+         *
+         * Previous linear scan was O(n) per call. `qRcmd getw` calls
+         * this once per capture entry (up to 512) on every status query,
+         * which was the dominant cost of the response. */
+        const size_t module_count = m_debug_process.GetModuleCount();
+        if (module_count > 0) {
+            size_t lo = 0, hi = module_count;
+            while (lo < hi) {
+                const size_t mid = lo + (hi - lo) / 2;
+                if (m_debug_process.GetModuleBaseAddress(mid) <= address) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            /* `lo` is the first module strictly above address; the
+             * candidate is the one just before it. */
+            if (lo > 0) {
+                const size_t cand = lo - 1;
+                const u64 base = m_debug_process.GetModuleBaseAddress(cand);
+                const u64 size = m_debug_process.GetModuleSize(cand);
+                if (address < base + size) {
+                    m_watch_data.base = base;
+                    m_watch_data.offset = address - base;
+                    m_watch_data.module_name = m_debug_process.GetModuleName(cand);
+                    return;
+                }
+            }
+        }
+        if (m_debug_process.GetAliasRegionAddress() <= address && address < m_debug_process.GetAliasRegionAddress() + m_debug_process.GetAliasRegionSize()) {
+            m_watch_data.base = m_debug_process.GetAliasRegionAddress();
+            m_watch_data.offset = address - m_debug_process.GetAliasRegionAddress();
+            sprintf(m_watch_data.name, "Alias");
+            return;
+        }
+        if (m_debug_process.GetHeapRegionAddress() <= address && address < m_debug_process.GetHeapRegionAddress() + m_debug_process.GetHeapRegionSize()) {
+            m_watch_data.base = m_debug_process.GetHeapRegionAddress();
+            m_watch_data.offset = address - m_debug_process.GetHeapRegionAddress();
+            sprintf(m_watch_data.name, "Heap");
+            return;
+        }
+        if (m_debug_process.GetStackRegionAddress() <= address && address < m_debug_process.GetStackRegionAddress() + m_debug_process.GetStackRegionSize()) {
+            m_watch_data.base = m_debug_process.GetStackRegionAddress();
+            m_watch_data.offset = address - m_debug_process.GetStackRegionAddress();
+            sprintf(m_watch_data.name, "Stack");
+            return;
+        }
+        if (m_debug_process.GetAslrRegionAddress() <= address && address < m_debug_process.GetAslrRegionAddress() + m_debug_process.GetAslrRegionSize()) {
+            m_watch_data.base = m_debug_process.GetAslrRegionAddress();
+            m_watch_data.offset = address - m_debug_process.GetAslrRegionAddress();
+            sprintf(m_watch_data.name, "Aslr");
+            return;
+        }
+    }
+
+    namespace {
+
+        constexpr u32 DcZva = 0xD50B7420;
+
+        constexpr bool IsExclusive(u32 insn)      { return (insn & 0x3F800000) == 0x08000000; }
+        constexpr bool IsStoreExclusive(u32 insn) { return (insn & 0x3FC00000) == 0x08000000; }
+
+        /* Bytes the load or store at a hit touches, from the reported address up. */
+        u32 FieldWatchAccessWidth(u32 insn) {
+            if ((insn & 0xFFFFFFE0) == DcZva) {
+                return 64;
+            }
+            if ((insn & 0x3A000000) == 0x28000000) {
+                /* Pair. */
+                if (insn & (1u << 26)) {
+                    return 2 * (4u << (insn >> 30));
+                }
+                return (insn >> 31) ? 16 : 8;
+            }
+            if ((insn & 0x3F000000) == 0x08000000) {
+                /* Exclusive and ordered. */
+                const u32 width = 1u << (insn >> 30);
+                return (IsExclusive(insn) && (insn & (1u << 21))) ? 2 * width : width;
+            }
+            if ((insn & 0x3A000000) == 0x38000000) {
+                /* Register, every addressing mode. */
+                if ((insn & (1u << 26)) && (insn & (1u << 23)) && (insn >> 30) == 0) {
+                    return 16;
+                }
+                return 1u << (insn >> 30);
+            }
+            return 1;
+        }
+
+    }
+
+    void GdbServerImpl::FieldWatchSet() {
+        /* A sweep goes on from the bitmap the client sent. */
+        m_fw_sweep = m_watch_data.x30_catch_type == FIELD_SWEEP;
+        m_watch_data.count = 0;
+        if (!m_fw_sweep) {
+            std::memset(std::addressof(m_watch_data.fromU), 0, sizeof(m_watch_data.fromU));
+        }
+
+        const u64 size = static_cast<u64>(m_watch_data.size);
+        if (m_watch_data.size <= 0 || size > field_watch_max_size || !(m_watch_data.read || m_watch_data.write)) {
+            m_watch_data.failed = 1;
+            return;
+        }
+
+        m_fw_lo         = m_watch_data.address;
+        m_fw_hi         = m_watch_data.address + size;
+        m_fw_read       = m_watch_data.read;
+        m_fw_write      = m_watch_data.write;
+        m_fw_lifted     = 0;
+        m_fw_state      = FieldWatchState::None;
+        m_fw_step_pc    = 0;
+        m_fw_dirty      = false;
+        m_fw_sweep_cursor = 0;
+        m_fw_sweep_start  = os::GetSystemTick();
+        m_fw_block_count = this->FieldWatchBuildCover(m_fw_blocks);
+
+        for (u32 i = 0; i < m_fw_block_count; i++) {
+            if (R_FAILED(m_debug_process.SetWatchPoint(m_fw_blocks[i].address, m_fw_blocks[i].size, m_fw_read, m_fw_write))) {
+                /* Out of watchpoints (a GDB client holds one) or a size the
+                 * hardware refuses: a part cover would read as fields never
+                 * accessed, so take none. */
+                for (u32 j = 0; j < i; j++) {
+                    static_cast<void>(m_debug_process.ClearWatchPoint(m_fw_blocks[j].address, m_fw_blocks[j].size));
+                }
+                m_fw_block_count = 0;
+                m_watch_data.failed = 1;
+                return;
+            }
+        }
+        m_fw_active = true;
+        g_gen2_fast_tick = m_fw_sweep;
+    }
+
+    /* The watchpoints for every qword of the instance that still has a byte
+     * never accessed: at most four, each a power-of-two size at an address
+     * aligned to it, so they take in some of what lies between and around.
+     * A byte already marked has nothing more to tell, and it is the fields
+     * the game uses all the time that get marked first: leaving them out is
+     * what lets the game run at speed again. */
+    u32 GdbServerImpl::FieldWatchBuildCover(FieldWatchBlock *out) const {
+        if (m_fw_sweep) {
+            return this->FieldWatchBuildSweep(out);
+        }
+        const u8 *bits = reinterpret_cast<const u8 *>(std::addressof(m_watch_data.fromU));
+        auto enclosing = [](u64 lo, u64 hi) -> FieldWatchBlock {
+            u64 size = 8;
+            while (util::AlignDown(lo, size) + size < hi) {
+                size <<= 1;
+            }
+            return { util::AlignDown(lo, size), size };
+        };
+
+        /* Aligned power-of-two blocks nest or are apart, never overlap: the
+         * list stays sorted and disjoint through every merge. */
+        FieldWatchBlock list[util::size(m_fw_blocks) + 1];
+        u32 count = 0;
+        for (u64 qword = util::AlignDown(m_fw_lo, 8); qword < m_fw_hi; qword += 8) {
+            bool unseen = false;
+            for (u64 a = std::max(qword, m_fw_lo); a < std::min(qword + 8, m_fw_hi) && !unseen; a++) {
+                unseen = (bits[(a - m_fw_lo) >> 3] & (1u << ((a - m_fw_lo) & 7))) == 0;
+            }
+            if (!unseen) {
+                continue;
+            }
+            list[count++] = { qword, 8 };
+
+            /* Two halves of one block cost nothing to join. */
+            while (count >= 2) {
+                const FieldWatchBlock &a = list[count - 2], &b = list[count - 1];
+                const FieldWatchBlock whole = enclosing(a.address, b.address + b.size);
+                if (a.address + a.size != b.address || whole.size != a.size + b.size) {
+                    break;
+                }
+                list[count - 2] = whole;
+                count--;
+            }
+
+            /* One too many: join the neighbours that need the smallest block. */
+            if (count > util::size(m_fw_blocks)) {
+                u32 best = 0;
+                FieldWatchBlock merged = enclosing(list[0].address, list[1].address + list[1].size);
+                for (u32 i = 1; i + 1 < count; i++) {
+                    const FieldWatchBlock candidate = enclosing(list[i].address, list[i + 1].address + list[i + 1].size);
+                    if (candidate.size < merged.size) {
+                        merged = candidate;
+                        best   = i;
+                    }
+                }
+                u32 kept = 0;
+                for (u32 i = 0; i < count; i++) {
+                    if (i == best) {
+                        list[kept++] = merged;
+                    } else if (!(merged.address <= list[i].address && list[i].address + list[i].size <= merged.address + merged.size)) {
+                        list[kept++] = list[i];
+                    }
+                }
+                count = kept;
+            }
+        }
+        for (u32 i = 0; i < count; i++) {
+            out[i] = list[i];
+        }
+        return count;
+    }
+
+    /* The sweep's watchpoints: what is still unseen cut into exact pieces - each
+     * run of wholly unseen qwords into the aligned power-of-two blocks that tile
+     * it, a part-seen qword down to the bytes from its first unseen one to its last -
+     * and four of the pieces, from m_fw_sweep_cursor on. Nothing seen is
+     * watched, so nothing stops the game until an unseen byte is accessed. */
+    u32 GdbServerImpl::FieldWatchBuildSweep(FieldWatchBlock *out) const {
+        const u8 *bits = reinterpret_cast<const u8 *>(std::addressof(m_watch_data.fromU));
+        auto seen = [&](u64 a) {
+            return a < m_fw_lo || a >= m_fw_hi || (bits[(a - m_fw_lo) >> 3] & (1u << ((a - m_fw_lo) & 7))) != 0;
+        };
+        /* How many of a qword's eight bytes are still unseen. */
+        auto unseen_in = [&](u64 qword) {
+            u32 count = 0;
+            for (u64 a = qword; a < qword + 8; a++) {
+                count += seen(a) ? 0 : 1;
+            }
+            return count;
+        };
+        /* Calls piece(block) for each, in address order. Only qwords with all
+         * eight bytes unseen join into larger blocks: one with a seen byte in
+         * it would bring that byte's accesses back, and those are the frequent
+         * ones. It is watched by itself, from its first unseen byte to its last. */
+        auto for_each_piece = [&](auto piece) {
+            const u64 end = util::AlignUp(m_fw_hi, 8);
+            u64 qword = util::AlignDown(m_fw_lo, 8);
+            while (qword < end) {
+                const u32 unseen = unseen_in(qword);
+                if (unseen == 0) {
+                    qword += 8;
+                    continue;
+                }
+                if (unseen < 8) {
+                    u64 first = qword, last = qword + 7;
+                    while (seen(first)) { first++; }
+                    while (seen(last)) { last--; }
+                    piece(FieldWatchBlock{ first, last - first + 1 });
+                    qword += 8;
+                    continue;
+                }
+                u64 run_end = qword + 8;
+                while (run_end < end && unseen_in(run_end) == 8) {
+                    run_end += 8;
+                }
+                while (qword < run_end) {
+                    u64 size = 8;
+                    while (util::IsAligned(qword, size * 2) && qword + size * 2 <= run_end) {
+                        size *= 2;
+                    }
+                    piece(FieldWatchBlock{ qword, size });
+                    qword += size;
+                }
+            }
+        };
+
+        u32 total = 0;
+        for_each_piece([&](const FieldWatchBlock &) { total++; });
+        if (total == 0) {
+            return 0;
+        }
+        const u32 count = std::min<u32>(total, util::size(m_fw_blocks));
+        const u32 start = m_fw_sweep_cursor % total;
+        u32 index = 0, taken = 0;
+        FieldWatchBlock picked[util::size(m_fw_blocks)];
+        for_each_piece([&](const FieldWatchBlock &block) {
+            if ((index + total - start) % total < count) {
+                picked[taken++] = block;
+            }
+            index++;
+        });
+        for (u32 i = 0; i < taken; i++) {
+            out[i] = picked[i];
+        }
+        return taken;
+    }
+
+    /* Leaves m_watch_data alone: the bitmap is the result, and the client reads
+     * it after the watch has gone. */
+    void GdbServerImpl::FieldWatchClear() {
+        if (m_debug_process.IsValid()) {
+            if (m_fw_step_pc != 0) {
+                static_cast<void>(m_debug_process.ClearHardwareBreakPoint(m_fw_step_pc, sizeof(u32)));
+            }
+            for (u32 i = 0; i < m_fw_block_count; i++) {
+                if ((m_fw_lifted & (1u << i)) == 0) {
+                    static_cast<void>(m_debug_process.ClearWatchPoint(m_fw_blocks[i].address, m_fw_blocks[i].size));
+                }
+            }
+            /* The other threads are held while one steps to m_fw_step_pc, and
+             * that breakpoint has just gone. */
+            if (m_fw_state == FieldWatchState::Step) {
+                static_cast<void>(m_debug_process.Continue());
+            }
+        }
+        m_fw_active      = false;
+        g_gen2_fast_tick = false;
+        m_fw_block_count = 0;
+        m_fw_lifted      = 0;
+        m_fw_step_pc     = 0;
+        m_fw_state       = FieldWatchState::None;
+    }
+
+    bool GdbServerImpl::FieldWatchCovers(u64 address) const {
+        /* The reported address is the lowest byte the access touched, which for
+         * one that starts short of a block is below it. */
+        for (u32 i = 0; i < m_fw_block_count; i++) {
+            if (m_fw_blocks[i].address <= address + 16 && address < m_fw_blocks[i].address + m_fw_blocks[i].size) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void GdbServerImpl::FieldWatchLift(u64 address) {
+        u8 lift = 0;
+        for (u32 i = 0; i < m_fw_block_count; i++) {
+            if (m_fw_blocks[i].address <= address && address < m_fw_blocks[i].address + m_fw_blocks[i].size) {
+                lift = 1u << i;
+            }
+        }
+        if (lift == 0) {
+            lift = (1u << m_fw_block_count) - 1;
+        }
+        for (u32 i = 0; i < m_fw_block_count; i++) {
+            if ((lift & (1u << i)) && (m_fw_lifted & (1u << i)) == 0) {
+                if (R_FAILED(m_debug_process.ClearWatchPoint(m_fw_blocks[i].address, m_fw_blocks[i].size))) {
+                    m_watch_data.failed = 3;
+                }
+                m_fw_lifted |= (1u << i);
+            }
+        }
+    }
+
+    void GdbServerImpl::FieldWatchRearm() {
+        if (m_fw_step_pc != 0) {
+            static_cast<void>(m_debug_process.ClearHardwareBreakPoint(m_fw_step_pc, sizeof(u32)));
+            m_fw_step_pc = 0;
+        }
+        /* Bytes were marked for the first time since the cover was built: it
+         * may be able to leave them out now. */
+        if (m_fw_dirty) {
+            m_fw_dirty = false;
+            FieldWatchBlock cover[util::size(m_fw_blocks)];
+            const u32 count = this->FieldWatchBuildCover(cover);
+            bool same = count == m_fw_block_count;
+            for (u32 i = 0; same && i < count; i++) {
+                same = cover[i].address == m_fw_blocks[i].address && cover[i].size == m_fw_blocks[i].size;
+            }
+            if (!same) {
+                for (u32 i = 0; i < m_fw_block_count; i++) {
+                    if ((m_fw_lifted & (1u << i)) == 0) {
+                        static_cast<void>(m_debug_process.ClearWatchPoint(m_fw_blocks[i].address, m_fw_blocks[i].size));
+                    }
+                }
+                m_fw_block_count = count;
+                for (u32 i = 0; i < count; i++) {
+                    m_fw_blocks[i] = cover[i];
+                }
+                m_fw_lifted = static_cast<u8>((1u << count) - 1);
+            }
+        }
+        for (u32 i = 0; i < m_fw_block_count; i++) {
+            if (m_fw_lifted & (1u << i)) {
+                if (R_FAILED(m_debug_process.SetWatchPoint(m_fw_blocks[i].address, m_fw_blocks[i].size, m_fw_read, m_fw_write))) {
+                    m_watch_data.failed = 4;
+                }
+            }
+        }
+        m_fw_lifted = 0;
+        m_fw_state  = FieldWatchState::None;
+    }
+
+    /* A wait whose breakpoint the game never reached (the exclusive sequence
+     * branched away) would leave a block unwatched for good, and a step whose
+     * thread never arrived would leave the game held. */
+    void GdbServerImpl::FieldWatchTick() {
+        if (!m_fw_active) {
+            return;
+        }
+        if (m_fw_state == FieldWatchState::None) {
+            /* Nothing in flight: a sweep moves on to the next four pieces. */
+            if (m_fw_sweep && os::ConvertToTimeSpan(os::GetSystemTick() - m_fw_sweep_start) >= TimeSpan::FromMilliSeconds(100)) {
+                m_fw_sweep_start   = os::GetSystemTick();
+                m_fw_sweep_cursor += util::size(m_fw_blocks);
+                m_fw_dirty         = true;
+                this->FieldWatchRearm();
+            }
+            return;
+        }
+        const auto elapsed = os::ConvertToTimeSpan(os::GetSystemTick() - m_fw_state_start);
+        if (m_fw_state == FieldWatchState::Wait && elapsed > TimeSpan::FromMilliSeconds(50)) {
+            this->FieldWatchRearm();
+        } else if (m_fw_state == FieldWatchState::Step && elapsed > TimeSpan::FromMilliSeconds(500)) {
+            this->FieldWatchRearm();
+            static_cast<void>(m_debug_process.Continue());
+        }
+    }
+
+    GdbServerImpl::FieldWatchResume GdbServerImpl::FieldWatchOnAccess(u64 thread_id, u64 address) {
+        m_watch_data.intercepted = true;
+
+        /* Every thread was running: end that wait first, there is one step slot. */
+        if (m_fw_state == FieldWatchState::Wait) {
+            this->FieldWatchRearm();
+        }
+
+        svc::ThreadContext ctx;
+        if (R_FAILED(m_debug_process.GetThreadContext(std::addressof(ctx), thread_id, svc::ThreadContextFlag_Control))) {
+            /* No PC to step to: let the access through unwatched, the tick
+             * puts the block back. */
+            m_watch_data.failed = 1;
+            this->FieldWatchLift(address);
+            if (m_fw_state == FieldWatchState::Step) {
+                return FieldWatchResume::Thread;
+            }
+            m_fw_state       = FieldWatchState::Wait;
+            m_fw_state_start = os::GetSystemTick();
+            return FieldWatchResume::All;
+        }
+
+        u32 insn = 0;
+        static_cast<void>(m_debug_process.ReadMemory(std::addressof(insn), ctx.pc, sizeof(insn)));
+
+        /* Record it. */
+        {
+            u64 begin = address;
+            const u64 width = FieldWatchAccessWidth(insn);
+            if (width == 64) {
+                begin = util::AlignDown(address, 64);
+            }
+            u64 end = std::min(begin + width, m_fw_hi);
+            begin   = std::max(begin, m_fw_lo);
+            if (m_fw_sweep) {
+                /* A sweep's blocks are exact, and the reported address of an
+                 * access that starts before one may be anywhere from its start
+                 * to the block: only what lies in the block that fired is known
+                 * to have been accessed. That is the block holding the address,
+                 * or the first one above it. */
+                const FieldWatchBlock *fired = nullptr;
+                for (u32 i = 0; i < m_fw_block_count; i++) {
+                    const FieldWatchBlock &block = m_fw_blocks[i];
+                    if (address < block.address + block.size && (fired == nullptr || block.address < fired->address)) {
+                        fired = std::addressof(block);
+                    }
+                }
+                if (fired != nullptr) {
+                    begin = std::max(begin, fired->address);
+                    end   = std::min(std::max(end, fired->address + 1), fired->address + fired->size);
+                }
+            }
+            u8 *bits = reinterpret_cast<u8 *>(std::addressof(m_watch_data.fromU));
+            for (u64 a = begin; a < end; a++) {
+                const u8 bit = static_cast<u8>(1u << ((a - m_fw_lo) & 7));
+                if ((bits[(a - m_fw_lo) >> 3] & bit) == 0) {
+                    bits[(a - m_fw_lo) >> 3] |= bit;
+                    m_fw_dirty = true;
+                }
+            }
+        }
+
+        m_watch_data.total_trigger++;
+        if (m_watch_data.total_trigger >= m_watch_data.max_trigger) {
+            this->FieldWatchClear();
+            return FieldWatchResume::All;
+        }
+
+        this->FieldWatchLift(address);
+
+        /* A step is already on its way: this is the same access reaching a
+         * second block, or a thread whose hit was queued behind it. Either runs
+         * on to the breakpoint that is set. */
+        if (m_fw_state == FieldWatchState::Step) {
+            return FieldWatchResume::Thread;
+        }
+
+        /* The stop itself clears the exclusive monitor, so a store-exclusive
+         * that hit fails and its loop retries: watched again it would hit and
+         * fail for ever. FieldWatchOnStep lets the retry through. A
+         * load-exclusive runs unwatched to past the store it pairs with. */
+        m_fw_step_pc = ctx.pc + 4;
+        m_fw_state   = FieldWatchState::Step;
+        m_fw_excl    = false;
+        if (IsStoreExclusive(insn)) {
+            m_fw_excl    = true;
+            m_fw_excl_rs = (insn >> 16) & 0x1F;
+        } else if (IsExclusive(insn)) {
+            u32 next[16];
+            if (R_SUCCEEDED(m_debug_process.ReadMemory(next, ctx.pc + 4, sizeof(next)))) {
+                for (size_t i = 0; i < util::size(next); i++) {
+                    if (IsStoreExclusive(next[i])) {
+                        /* A branch may leave the sequence before the store, so
+                         * the other threads cannot be held for this one. */
+                        m_fw_step_pc = ctx.pc + 4 + (i + 1) * sizeof(u32);
+                        m_fw_state   = FieldWatchState::Wait;
+                        break;
+                    }
+                }
+            }
+        }
+        m_fw_state_start = os::GetSystemTick();
+
+        if (R_FAILED(m_debug_process.SetHardwareBreakPoint(m_fw_step_pc, sizeof(u32), false))) {
+            /* Nowhere to put the block back from: run the access unwatched and
+             * let the tick restore it. */
+            m_watch_data.failed = 2;
+            m_fw_step_pc = 0;
+            m_fw_state   = FieldWatchState::Wait;
+        }
+        return m_fw_state == FieldWatchState::Step ? FieldWatchResume::Thread : FieldWatchResume::All;
+    }
+
+    /* The breakpoint at m_fw_step_pc. The caller continues every thread. */
+    void GdbServerImpl::FieldWatchOnStep(u64 thread_id) {
+        m_watch_data.intercepted = true;
+
+        if (m_fw_state == FieldWatchState::Step && m_fw_excl && m_fw_excl_rs != 31) {
+            svc::ThreadContext ctx;
+            if (R_SUCCEEDED(m_debug_process.GetThreadContext(std::addressof(ctx), thread_id, svc::ThreadContextFlag_General)) && static_cast<u32>(ctx.r[m_fw_excl_rs]) != 0) {
+                /* The store failed. Its retry runs unwatched, to the
+                 * instruction after the loop's branch back. */
+                static_cast<void>(m_debug_process.ClearHardwareBreakPoint(m_fw_step_pc, sizeof(u32)));
+                m_fw_excl        = false;
+                m_fw_step_pc    += sizeof(u32);
+                m_fw_state       = FieldWatchState::Wait;
+                m_fw_state_start = os::GetSystemTick();
+                if (R_FAILED(m_debug_process.SetHardwareBreakPoint(m_fw_step_pc, sizeof(u32), false))) {
+                    m_fw_step_pc = 0;
+                }
+                return;
+            }
+        }
+        this->FieldWatchRearm();
+    }
+
+    namespace {
+        /* What the software breakpoints write: an undefined instruction. */
+        constexpr u32 MethodWatchBreak = 0xE7FFFFFF;
+    }
+
+    /* The table as the client sees it. */
+    void GdbServerImpl::MethodWatchSync() {
+        static_assert(MethodWatchMax == max_method_watch);
+        m_method_t *out = reinterpret_cast<m_method_t *>(std::addressof(m_watch_data.fromU));
+        for (u32 i = 0; i < m_mw_count; i++) {
+            out[i].method = m_mw[i].method;
+            out[i].caller = m_mw[i].caller;
+            out[i].state  = m_mw[i].state;
+            out[i].self   = m_mw[i].self;
+        }
+    }
+
+    /* A fresh attach while a method or code watch is still held here: that
+     * watch was cut off. Its debugger went away without a detach from us (the
+     * console slept, or something else took the game), and its breaks are
+     * still in the game's code, where the first call would crash the game.
+     * The same process again: take them off, which is all a detach would have
+     * done. Another process: nothing of the table is in it. */
+    /* Every detach that does not come through clearw(): the events thread
+     * on its way out (which is how the object's destruction detaches - the
+     * console going to sleep is enough to destroy it), a new attach request,
+     * a GDB client's detach. A method or code watch may be armed, its breaks
+     * in the game's code, and after the detach nothing can take them off. */
+    void GdbServerImpl::DetachWithWatchBreaksOff() {
+        {
+            std::scoped_lock lk(g_watch_data_lock);
+            if (m_debug_process.IsValid()) {
+                if (m_mw_active) {
+                    this->MethodWatchClear();
+                    m_watch_data.address = 0;
+                }
+                if (m_cw_active) {
+                    this->CodeWatchDisarm();
+                    m_watch_data.address = 0;
+                }
+                this->CodeWatchClose();
+            }
+        }
+        m_debug_process.Detach();
+    }
+
+    void GdbServerImpl::WatchTablesAfterAttach() {
+        std::scoped_lock lk(g_watch_data_lock);
+        const bool same = m_debug_process.IsValid();
+        if (same && m_mw_active && m_mw_pid == m_process_id.value) {
+            this->MethodWatchClear();
+        }
+        m_mw_active = false;
+        m_mw_count  = 0;
+        if (same && m_cw_active && m_cw_pid == m_process_id.value) {
+            this->CodeWatchDisarm();
+        }
+        m_cw_active = false;
+        this->CodeWatchClose();
+    }
+
+    void GdbServerImpl::MethodWatchSet() {
+        const m_method_t *in = reinterpret_cast<const m_method_t *>(std::addressof(m_watch_data.fromU));
+        const u32 count = static_cast<u32>(std::clamp<int>(m_watch_data.size, 0, MethodWatchMax));
+        m_watch_data.count = 0;
+        m_mw_main  = m_watch_data.main_start;
+        m_mw_count = count;
+        m_mw_pid   = m_process_id.value;
+        for (u32 i = 0; i < count; i++) {
+            MethodWatchEntry &e = m_mw[i];
+            e.method = in[i].method;
+            e.caller = 0;
+            e.self   = 0;
+            e.state  = METHOD_NOT_SET;
+            const u64 address = m_mw_main + e.method;
+            /* One already there is somebody else's breakpoint: not ours to take off. */
+            if (R_SUCCEEDED(m_debug_process.ReadMemory(std::addressof(e.original), address, sizeof(u32))) && e.original != MethodWatchBreak) {
+                if (R_SUCCEEDED(m_debug_process.WriteMemory(std::addressof(MethodWatchBreak), address, sizeof(u32)))) {
+                    e.state = METHOD_ARMED;
+                }
+            }
+        }
+        m_mw_active = true;
+        this->MethodWatchSync();
+    }
+
+    /* Takes the break off every method not called. One that no longer holds
+     * our break was rewritten by something else - a cheat hooking that entry
+     * does it twelve times a second - so whether it was called is not known,
+     * and the instruction there now is not ours to replace. */
+    void GdbServerImpl::MethodWatchClear() {
+        if (m_mw_active && m_debug_process.IsValid()) {
+            for (u32 i = 0; i < m_mw_count; i++) {
+                MethodWatchEntry &e = m_mw[i];
+                if (e.state != METHOD_ARMED) {
+                    continue;
+                }
+                const u64 address = m_mw_main + e.method;
+                u32 now = 0;
+                if (R_SUCCEEDED(m_debug_process.ReadMemory(std::addressof(now), address, sizeof(u32))) && now == MethodWatchBreak) {
+                    static_cast<void>(m_debug_process.WriteMemory(std::addressof(e.original), address, sizeof(u32)));
+                } else {
+                    e.state = METHOD_OVERWRITTEN;
+                }
+            }
+            if (m_watch_data.x30_catch_type == METHOD_WATCH) {
+                this->MethodWatchSync();
+            }
+        }
+        m_mw_active = false;
+    }
+
+    /* An undefined instruction at `address`: one of ours? Then the caller continues the game. */
+    bool GdbServerImpl::MethodWatchOnBreak(u64 thread_id, u64 address) {
+        for (u32 i = 0; i < m_mw_count; i++) {
+            MethodWatchEntry &e = m_mw[i];
+            if (m_mw_main + e.method != address) {
+                continue;
+            }
+            /* Not armed: another thread's hit put the instruction back while
+             * this one was on its way. It runs the real instruction now. */
+            if (e.state == METHOD_ARMED) {
+                if (R_FAILED(m_debug_process.WriteMemory(std::addressof(e.original), address, sizeof(u32)))) {
+                    m_watch_data.failed = 5;
+                }
+                e.state = METHOD_CALLED;
+                svc::ThreadContext ctx;
+                /* x0 with the return address: at a method's first instruction it
+                 * still holds the first argument, which for an instance method
+                 * is the object. */
+                if (R_SUCCEEDED(m_debug_process.GetThreadContext(std::addressof(ctx), thread_id, svc::ThreadContextFlag_Control | svc::ThreadContextFlag_General))) {
+                    if (ctx.lr >= m_mw_main && ctx.lr - m_mw_main < (1ul << 30)) {
+                        e.caller = static_cast<u32>((ctx.lr - m_mw_main) >> 2);
+                    }
+                    e.self = ctx.r[0];
+                }
+                if (m_mw_active && m_watch_data.x30_catch_type == METHOD_WATCH) {
+                    m_watch_data.total_trigger++;
+                    m_method_t *out = reinterpret_cast<m_method_t *>(std::addressof(m_watch_data.fromU));
+                    out[i].method = e.method;
+                    out[i].caller = e.caller;
+                    out[i].state  = e.state;
+                    out[i].self   = e.self;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    void GdbServerImpl::CodeWatchClose() {
+        if (m_cw_file_open) {
+            fs::CloseFile(m_cw_file);
+            m_cw_file_open = false;
+        }
+        m_cw_count    = 0;
+        m_cw_chunk_at = 0xFFFFFFFF;
+    }
+
+    bool GdbServerImpl::CodeWatchChunkLoad(u32 chunk) {
+        if (m_cw_chunk_at == chunk) {
+            return true;
+        }
+        m_cw_chunk_at = 0xFFFFFFFF;
+        const u32 count = std::min<u32>(CodeWatchChunk, m_cw_count - chunk * CodeWatchChunk);
+        if (!m_cw_file_open || R_FAILED(fs::ReadFile(m_cw_file, static_cast<s64>(chunk) * sizeof(m_cw_chunk), m_cw_chunk, count * sizeof(m_code_entry_t)))) {
+            return false;
+        }
+        m_cw_chunk_at = chunk;
+        return true;
+    }
+
+    /* The hits kept here go to the end of the file. The client reads that
+     * file, and while it has it open ours fails: wait for it, the game with us. */
+    void GdbServerImpl::CodeWatchSpill() {
+        if (m_cw_ring_count == 0) {
+            return;
+        }
+        bool written = false;
+        for (int attempt = 0; attempt < 400 && !written; attempt++) {
+            fs::FileHandle file;
+            if (R_SUCCEEDED(fs::OpenFile(std::addressof(file), CODE_WATCH_HITS, fs::OpenMode_Write | fs::OpenMode_AllowAppend))) {
+                s64 size = 0;
+                written = R_SUCCEEDED(fs::GetFileSize(std::addressof(size), file)) &&
+                          R_SUCCEEDED(fs::WriteFile(file, size, m_cw_ring, m_cw_ring_count * sizeof(m_code_hit_t), fs::WriteOption::Flush));
+                fs::CloseFile(file);
+                if (!written) {
+                    break;
+                }
+            } else {
+                os::SleepThread(TimeSpan::FromMilliSeconds(5));
+            }
+        }
+        if (!written) {
+            m_watch_data.failed = 7;
+        }
+        m_cw_ring_count = 0;
+        if (m_watch_data.x30_catch_type == CODE_WATCH) {
+            m_watch_data.count = 0;
+        }
+    }
+
+    void GdbServerImpl::CodeWatchArm() {
+        static_assert(sizeof(m_cw_ring) == sizeof(m_watch_data.fromU));
+        this->CodeWatchClose();
+        m_watch_data.count         = 0;
+        m_watch_data.total_trigger = 0;
+        m_cw_ring_count = 0;
+        m_cw_hits       = 0;
+        m_cw_main       = m_watch_data.main_start;
+        m_cw_pid        = m_process_id.value;
+        const u32 count = static_cast<u32>(std::min<u64>(m_watch_data.v1, max_code_watch));
+        u32 not_set = 0;
+        bool ok = count != 0 && R_SUCCEEDED(fs::OpenFile(std::addressof(m_cw_file), CODE_WATCH_LIST, fs::OpenMode_Read | fs::OpenMode_Write));
+        m_cw_file_open = ok;
+        m_cw_count     = ok ? count : 0;
+        u32 last = 0;
+        for (u32 chunk = 0; ok && chunk * CodeWatchChunk < count; chunk++) {
+            const u32 n = std::min<u32>(CodeWatchChunk, count - chunk * CodeWatchChunk);
+            const s64 at = static_cast<s64>(chunk) * sizeof(m_cw_chunk);
+            ok = R_SUCCEEDED(fs::ReadFile(m_cw_file, at, m_cw_chunk, n * sizeof(m_code_entry_t)));
+            for (u32 i = 0; ok && i < n; i++) {
+                m_code_entry_t &e = m_cw_chunk[i];
+                /* The search needs them in order, and a function listed twice
+                 * would get the break as its own original instruction. */
+                if ((chunk != 0 || i != 0) && e.method <= last) {
+                    ok = false;
+                    break;
+                }
+                last = e.method;
+                const u64 address = m_cw_main + e.method;
+                u32 original = 0;
+                if (R_SUCCEEDED(m_debug_process.ReadMemory(std::addressof(original), address, sizeof(u32))) && original != MethodWatchBreak &&
+                    R_SUCCEEDED(m_debug_process.WriteMemory(std::addressof(MethodWatchBreak), address, sizeof(u32)))) {
+                    e.original = original;
+                } else {
+                    /* One already there is somebody else's breakpoint: not ours to take off. */
+                    e.original = MethodWatchBreak;
+                    not_set++;
+                }
+            }
+            m_cw_index[chunk] = m_cw_chunk[0].method;
+            /* Written even when the chunk went wrong part way: the breaks
+             * put on so far have to come off, and that is read from here. */
+            if (R_FAILED(fs::WriteFile(m_cw_file, at, m_cw_chunk, n * sizeof(m_code_entry_t), fs::WriteOption::None))) {
+                ok = false;
+            }
+            m_cw_chunk_at = chunk;
+        }
+        if (m_cw_file_open) {
+            static_cast<void>(fs::FlushFile(m_cw_file));
+        }
+        m_cw_active = m_cw_file_open;
+        if (!ok) {
+            /* Whatever was armed comes off again. Functions past the point of
+             * failure hold original 0, which is never the break: left alone. */
+            this->CodeWatchDisarm();
+            this->CodeWatchClose();
+            m_watch_data.failed  = 6;
+            m_watch_data.address = 0;
+        }
+        m_watch_data.v1 = m_cw_count;
+        m_watch_data.v2 = not_set;
+    }
+
+    /* Takes the break off every function not called, and writes out the hits. */
+    void GdbServerImpl::CodeWatchDisarm() {
+        if (m_cw_active && m_cw_file_open && m_debug_process.IsValid()) {
+            for (u32 chunk = 0; chunk * CodeWatchChunk < m_cw_count; chunk++) {
+                if (!this->CodeWatchChunkLoad(chunk)) {
+                    m_watch_data.failed = 6;
+                    continue;
+                }
+                const u32 n = std::min<u32>(CodeWatchChunk, m_cw_count - chunk * CodeWatchChunk);
+                for (u32 i = 0; i < n; i++) {
+                    const m_code_entry_t &e = m_cw_chunk[i];
+                    if (e.original == MethodWatchBreak || e.original == 0) {
+                        continue;
+                    }
+                    const u64 address = m_cw_main + e.method;
+                    u32 now = 0;
+                    if (R_SUCCEEDED(m_debug_process.ReadMemory(std::addressof(now), address, sizeof(u32))) && now == MethodWatchBreak) {
+                        static_cast<void>(m_debug_process.WriteMemory(std::addressof(e.original), address, sizeof(u32)));
+                    }
+                }
+            }
+        }
+        if (m_cw_active) {
+            this->CodeWatchSpill();
+        }
+        m_cw_active = false;
+    }
+
+    bool GdbServerImpl::CodeWatchOnBreak(u64 thread_id, u64 address) {
+        if (m_cw_count == 0 || address < m_cw_main || address - m_cw_main > 0xFFFFFFFFul) {
+            return false;
+        }
+        const u32 method = static_cast<u32>(address - m_cw_main);
+        /* The last chunk that starts at or below it. */
+        const u32 chunks = (m_cw_count + CodeWatchChunk - 1) / CodeWatchChunk;
+        u32 lo = 0, hi = chunks;
+        while (hi - lo > 1) {
+            const u32 mid = lo + (hi - lo) / 2;
+            if (m_cw_index[mid] <= method) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        if (m_cw_index[lo] > method || !this->CodeWatchChunkLoad(lo)) {
+            return false;
+        }
+        const u32 n = std::min<u32>(CodeWatchChunk, m_cw_count - lo * CodeWatchChunk);
+        u32 a = 0, b = n;
+        while (a < b) {
+            const u32 mid = a + (b - a) / 2;
+            if (m_cw_chunk[mid].method < method) {
+                a = mid + 1;
+            } else {
+                b = mid;
+            }
+        }
+        if (a >= n || m_cw_chunk[a].method != method) {
+            return false;
+        }
+        const u32 original = m_cw_chunk[a].original;
+        if (original == MethodWatchBreak || original == 0) {
+            return false;
+        }
+        /* The break still there: this is the first call. Gone: another thread's
+         * hit, or the end of the watch, put the instruction back while this one
+         * was on its way, and it runs the real instruction now. */
+        u32 now = 0;
+        if (R_FAILED(m_debug_process.ReadMemory(std::addressof(now), address, sizeof(u32)))) {
+            return false;
+        }
+        if (now != MethodWatchBreak) {
+            return true;
+        }
+        if (R_FAILED(m_debug_process.WriteMemory(std::addressof(original), address, sizeof(u32)))) {
+            m_watch_data.failed = 5;
+            return false;
+        }
+        if (!m_cw_active) {
+            return true;
+        }
+        if (m_cw_ring_count >= static_cast<u32>(max_code_ring)) {
+            this->CodeWatchSpill();
+        }
+        m_code_hit_t &hit = m_cw_ring[m_cw_ring_count];
+        hit.method = method;
+        hit.caller = 0;
+        svc::ThreadContext ctx;
+        if (R_SUCCEEDED(m_debug_process.GetThreadContext(std::addressof(ctx), thread_id, svc::ThreadContextFlag_Control))) {
+            if (ctx.lr >= m_cw_main && ctx.lr - m_cw_main < (1ul << 34)) {
+                hit.caller = static_cast<u32>((ctx.lr - m_cw_main) >> 2);
+            }
+        }
+        m_cw_ring_count++;
+        m_cw_hits++;
+        if (m_watch_data.x30_catch_type == CODE_WATCH) {
+            reinterpret_cast<m_code_hit_t *>(std::addressof(m_watch_data.fromU))[m_cw_ring_count - 1] = hit;
+            m_watch_data.count         = static_cast<int>(m_cw_ring_count);
+            m_watch_data.total_trigger = m_cw_hits;
+        }
+        return true;
+    }
+
+    void GdbServerImpl::setw() {
+        char *reply_cur = m_buffer;
+        char *reply_end = m_buffer + sizeof(m_buffer);
+        m_watch_data.failed = 0;
+        m_watch_data.next_pc = 0;
+        if (!m_debug_process.IsValid()) {
+            m_watch_data.failed = 1;
+            AppendReplyFormat(reply_cur, reply_end, "Unable to set watch, no debug process attached\n");
+            return;
+        }
+        if (m_watch_data.x30_catch_type == FIELD_WATCH || m_watch_data.x30_catch_type == FIELD_SWEEP) {
+            this->FieldWatchSet();
+            return;
+        }
+        if (m_watch_data.x30_catch_type == METHOD_WATCH) {
+            this->MethodWatchSet();
+            return;
+        }
+        if (m_watch_data.x30_catch_type == CODE_WATCH) {
+            this->CodeWatchArm();
+            return;
+        }
+        if ((m_watch_data.read || m_watch_data.write) && m_debug_process.IsValidWatchPoint(m_watch_data.address, m_watch_data.size)) {
+            if (R_SUCCEEDED(m_debug_process.SetWatchPoint(m_watch_data.address, m_watch_data.size, m_watch_data.read, m_watch_data.write))) {
+                AppendReplyFormat(reply_cur, reply_end, "Watching 0x%010lx read=%d write=%d\n", m_watch_data.address, m_watch_data.read, m_watch_data.write);
+                m_watch_data.count = 0;
+                m_gen2_watch_active = true;
+                m_gen2_watch_address = m_watch_data.address;
+                m_gen2_watch_size = m_watch_data.size;
+                m_gen2_watch_read = m_watch_data.read;
+                m_gen2_watch_write = m_watch_data.write;
+            } else {
+                m_watch_data.failed = 1;
+                AppendReplyFormat(reply_cur, reply_end, "Unable to set Watchpoint 0x%010lx read=%d write=%d\n", m_watch_data.address, m_watch_data.read, m_watch_data.write);
+            }
+        }
+        if (!(m_watch_data.read || m_watch_data.write)) {
+            if (R_SUCCEEDED(m_debug_process.SetHardwareBreakPoint(m_watch_data.address, m_watch_data.size, false))) {
+                AppendReplyFormat(reply_cur, reply_end, "Watching Register X%d at 0x%010lx \n", m_watch_data.i, m_watch_data.address);
+                m_watch_data.count = 0;
+                m_gen2_watch_active = true;
+                m_gen2_watch_address = m_watch_data.address;
+                m_gen2_watch_size = m_watch_data.size;
+                m_gen2_watch_read = false;
+                m_gen2_watch_write = false;
+            } else {
+                m_watch_data.failed = 1;
+                AppendReplyFormat(reply_cur, reply_end, "Unable to set Breakpoint 0x%010lx \n", m_watch_data.address);
+            }
+        } else if (!m_debug_process.IsValidWatchPoint(m_watch_data.address, m_watch_data.size)) {
+            m_watch_data.failed = 1;
+            AppendReplyFormat(reply_cur, reply_end, "Invalid Watchpoint 0x%010lx size=%d\n", m_watch_data.address, m_watch_data.size);
+        }
+    }
+
+    void GdbServerImpl::clearw() {
+        char *reply_cur = m_buffer;
+        char *reply_end = m_buffer + sizeof(m_buffer);
+        const bool has_debug_process = m_debug_process.IsValid();
+        if (m_mw_active) {
+            this->MethodWatchClear();
+            m_watch_data.address = 0;
+            return;
+        }
+        if (m_cw_active) {
+            this->CodeWatchDisarm();
+            m_watch_data.address = 0;
+            return;
+        }
+        if (m_fw_active || m_fw_state != FieldWatchState::None) {
+            this->FieldWatchClear();
+            m_watch_data.address = 0;
+            return;
+        }
+        if (has_debug_process && m_watch_data.next_pc != 0 && m_watch_data.next_pc != 0x55AA55AA) {
+            m_debug_process.ClearHardwareBreakPoint(m_watch_data.next_pc, sizeof(u32));
+            m_watch_data.next_pc = 0;
+        }
+        const u64 address = m_gen2_watch_active ? m_gen2_watch_address : m_watch_data.address;
+        const u64 size = m_gen2_watch_active ? m_gen2_watch_size : m_watch_data.size;
+        const bool read = m_gen2_watch_active ? m_gen2_watch_read : m_watch_data.read;
+        const bool write = m_gen2_watch_active ? m_gen2_watch_write : m_watch_data.write;
+
+        if (!has_debug_process || address == 0) {
+            m_gen2_watch_active = false;
+            m_watch_data.address = 0;
+            return;
+        }
+        if (read || write) {
+            if (R_SUCCEEDED(m_debug_process.ClearWatchPoint(address, size))) {
+                AppendReplyFormat(reply_cur, reply_end, "Clearing Watchpoint 0x%010lx \n", address);
+            } else {
+                AppendReplyFormat(reply_cur, reply_end, "Unable to clear Watchpoint 0x%010lx \n", address);
+            }
+        } else {
+            if (R_SUCCEEDED(m_debug_process.ClearHardwareBreakPoint(address, size))) {
+                AppendReplyFormat(reply_cur, reply_end, "Clearing BreakPoint 0x%010lx \n", address);
+            } else {
+                AppendReplyFormat(reply_cur, reply_end, "Unable to clear BreakPoint 0x%010lx \n", address);
+            }
+        }
+        m_gen2_watch_active = false;
+        m_watch_data.address = 0;
+    }
+
     void GdbServerImpl::qRcmd() {
         /* Decode the command. */
         const auto packet_len = std::strlen(m_receive_packet);
@@ -1982,7 +4366,17 @@ namespace ams::dmnt {
                                                "get mapping {address}\n"
                                                "wait application\n"
                                                "wait {program id}\n"
-                                               "wait homebrew\n");
+                                               "wait homebrew\n"
+                                               "setw {r for read, w for write, blank for instruction}{address}\n"
+                                               "seti\n"
+                                               "getw\n"
+                                               "clearw\n"
+                                               "dbgregs\n"
+                                               "cont\n"
+                                               "gen2\n"
+                                               "attach\n"
+                                               "detach\n"
+                                               "Tomvita fork " GEN2_VERSION "a address = %010lx\n",(long unsigned int)&(m_watch_data.execute));
         } else if (ParsePrefix(command, "get base") || ParsePrefix(command, "get info") || ParsePrefix(command, "get modules")) {
             if (!this->HasDebugProcess()) {
                 AppendReplyFormat(reply_cur, reply_end, "Not attached.\n");
@@ -2062,6 +4456,182 @@ namespace ams::dmnt {
 
                 cur_addr = next_address;
             }
+        } else if (ParsePrefix(command, "detach")) {
+            this->DetachWithWatchBreaksOff();
+#if !defined(DMNT_GEN2_NO_CHEATVM)
+            dmnt::cheat::impl::SuspendDebugEvents(false);
+#endif
+            m_watch_data.attach_success = false;
+            AppendReplyFormat(reply_cur, reply_end, "Game detached\n");
+        } else if (ParsePrefix(command, "gen2")) {
+#if !defined(DMNT_GEN2_NO_CHEATVM)
+            dmnt::cheat::impl::SuspendDebugEvents(true);
+#endif
+            AppendReplyFormat(reply_cur, reply_end, "Game ready for Gen2\n");
+        } else if (ParsePrefix(command, "attach")) {
+            if (!this->HasDebugProcess()) {
+                /* Get the process id. */
+#if !defined(DMNT_GEN2_NO_CHEATVM)
+                if (dmnt::cheat::impl::GetHasActiveCheatProcess()) {
+                    dmnt::cheat::CheatProcessMetadata metadata = {};
+                    if (R_SUCCEEDED(dmnt::cheat::impl::GetCheatProcessMetadata(std::addressof(metadata)))) {
+                        m_watch_data.next_pid = metadata.process_id.value;
+                    }
+                } else {
+#endif
+                    int rc;
+                    if (R_FAILED(rc = pmdmntInitialize())) {
+                        AppendReplyFormat(reply_cur, reply_end, "pmdmntInitialize rc=%x\n", rc);
+                    };
+                    pmdmntGetApplicationProcessId(&(m_watch_data.next_pid));
+                    pmdmntExit();
+#if !defined(DMNT_GEN2_NO_CHEATVM)
+                }
+#endif
+
+                /* Set our process id. */
+                m_process_id = {m_watch_data.next_pid};
+
+                /* Wait for us to be attached. */
+                Gen2Attach();
+
+                /* If we're attached, send a stop reply packet. */
+                if (m_debug_process.IsValid()) {
+                    m_watch_data.attach_success = true;
+                    AppendReplyFormat(reply_cur, reply_end, "Attached to Game pid=%ld\n", m_watch_data.next_pid);
+                } else {
+                    m_watch_data.attach_success = false;
+                    AppendReplyFormat(reply_cur, reply_end, "Not able to attached to Game pid=%ld, maybe need to detach from dmnt, use command gen2\n", m_watch_data.next_pid);
+                }
+            } else {
+                m_watch_data.attach_success = true;
+                AppendReplyFormat(reply_cur, reply_end, "Attached to Game pid=%ld\n", m_process_id.value);
+            }
+        } else if (ParsePrefix(command, "cont")) {
+            /* Get thread id. */
+            GdbServerImpl::vCont();
+            // u64 thread_id = m_debug_process.GetThreadIdOverride();
+            // if (thread_id == 0 || thread_id == static_cast<u64>(-1)) {
+            //     thread_id = m_debug_process.GetLastThreadId();
+            // }
+
+            // /* Continue the thread. */
+            // Result result;
+            // if (thread_id == m_debug_process.GetLastThreadId()) {
+            //     result = m_debug_process.Continue(thread_id);
+            // } else {
+            //     result = m_debug_process.Continue();
+            // }
+
+            // if (R_SUCCEEDED(result)) {
+                // AppendReplyFormat(reply_cur, reply_end, "Continuing\n");
+            // } else {
+            //     AppendReplyFormat(reply_cur, reply_end, "Cannot Continue\n");
+            // }
+        } else if (ParsePrefix(command, "getw")) {
+            AppendReplyFormat(reply_cur, reply_end, "Watch hit count = %d trig = %ld\n", m_watch_data.count, m_watch_data.total_trigger);
+            get_region(m_watch_data.address);
+            AppendReplyFormat(reply_cur, reply_end, "address = %010lx %s %010lx\n", m_watch_data.address, m_watch_data.module_name, m_watch_data.offset);
+            AppendReplyFormat(reply_cur, reply_end, "fail code = %d \n", m_watch_data.failed);
+            // AppendReplyFormat(reply_cur, reply_end, "called from = 0x%010lx\n", m_watch_data.from);
+            AppendReplyFormat(reply_cur, reply_end, "next pc = 0x%010lx\n", m_watch_data.next_pc); 
+            // auto entry = m_watch_data.from.begin();
+            // while (entry != m_watch_data.from.end()) {
+            //     AppendReplyFormat(reply_cur, reply_end, "called from = 0x%010lx Count = %d\n", entry->first, entry->second);
+            // }
+            for (auto i = 0; i < m_watch_data.count; i++) {
+                if (m_watch_data.read || m_watch_data.write) {
+                    get_region(m_watch_data.fromU.from2[i].from_stack.address&0x7FFFFFFFFF);
+                    AppendReplyFormat(reply_cur, reply_end, "Accessed from 0x%010lx Count = %d %s+0x%08lx\n", m_watch_data.fromU.from2[i].from_stack.address&0x7FFFFFFFFF, m_watch_data.fromU.from2[i].count, m_watch_data.module_name, m_watch_data.offset);
+                } else {
+                    AppendReplyFormat(reply_cur, reply_end, "Register X%d has value 0x%010lx Count = %d\n", m_watch_data.i, m_watch_data.fromU.from[i].address&0x7FFFFFFFFF, m_watch_data.fromU.from[i].count);
+                }
+            }
+            m_watch_data.intercepted = false;
+        } else if (ParsePrefix(command, "dbgregs")) {
+            /* Dump the debug-register write trace.
+             *
+             * The ARM debug registers are per-core and the kernel neither
+             * saves nor restores them, so a watchpoint that silently stops
+             * firing has exactly two possible explanations, and this tells
+             * them apart:
+             *
+             *   - `want`/`on` differ on some row: the write never reached that
+             *     core, so that core never had the watchpoint at all.
+             *   - a row appears *after* your arm, writing the same D register
+             *     or the I register your watchpoint is linked to (`ctx`
+             *     below): something overwrote it.
+             *
+             * If there are no rows after your arm at all, nothing in dmnt
+             * touched the registers and the cause is below us.
+             * See WATCHPOINT_BUG.md. */
+            int last_bp = -1, first_ctx = -1, last_ctx = -1, last_wp = -1;
+            HardwareBreakPointManager::GetRegisterExtents(std::addressof(last_bp), std::addressof(first_ctx), std::addressof(last_ctx), std::addressof(last_wp));
+
+            AppendReplyFormat(reply_cur, reply_end, "registers: bp I0-I%d, ctx I%d-I%d, wp D0-D%d\n", last_bp, first_ctx, last_ctx, last_wp);
+            AppendReplyFormat(reply_cur, reply_end, "usable:    %zu execution bp, %zu watchpoints\n",
+                              HardwareBreakPointManager::GetUsableBreakPointCount(),
+                              HardwareWatchPointManager::GetUsableWatchPointCount());
+            AppendReplyFormat(reply_cur, reply_end, "exec ctx = I%d, watch ctx = I%d\n", first_ctx, first_ctx + 1);
+            AppendReplyFormat(reply_cur, reply_end, "now = 0x%016lx\n", os::GetSystemTick().GetInt64Value());
+
+            u64 total = 0;
+            DebugRegisterTraceEntry entry;
+            const size_t count = HardwareBreakPointManager::GetDebugRegisterTrace(0, std::addressof(entry), std::addressof(total));
+
+            AppendReplyFormat(reply_cur, reply_end, "writes = %lu (showing last %zu)\n", total, count);
+
+            for (size_t i = 0; i < count; ++i) {
+                if (HardwareBreakPointManager::GetDebugRegisterTrace(i, std::addressof(entry), nullptr) == 0) {
+                    break;
+                }
+
+                const bool is_wp = entry.reg >= static_cast<u32>(svc::HardwareBreakPointRegisterName_D0);
+                const u32 reg_ix = is_wp ? (entry.reg - static_cast<u32>(svc::HardwareBreakPointRegisterName_D0)) : entry.reg;
+
+                AppendReplyFormat(reply_cur, reply_end, "%s t=0x%016lx want=%d on=%d spins=%u %c%u ctl=0x%08lx val=0x%010lx rc=0x%08x\n",
+                                  (entry.requested_core != entry.observed_core) ? "MISS" : "    ",
+                                  entry.tick, entry.requested_core, entry.observed_core, entry.migrate_spins,
+                                  is_wp ? 'D' : 'I', reg_ix, entry.dbgbcr, entry.value, entry.result);
+            }
+        } else if (ParsePrefix(command, "clearw")) {
+            std::scoped_lock lk(g_watch_data_lock);
+            clearw();
+        } else if (ParsePrefix(command, "seti ")) {
+            /* Decode i. */
+            m_watch_data.i = DecodeDec(command);
+
+            if (m_watch_data.i > 30) m_watch_data.i = 30;
+
+            AppendReplyFormat(reply_cur, reply_end, "Set target register to X%d \n", m_watch_data.i);
+
+        } else if (ParsePrefix(command, "setw ")) {
+            if (!this->HasDebugProcess()) {
+                AppendReplyFormat(reply_cur, reply_end, "Not attached.\n");
+                return;
+            }
+            bool next_read = false;
+            bool next_write = false;
+            if (ParsePrefix(command, "r") || ParsePrefix(command, "R")) next_read = true;
+            if (ParsePrefix(command, "w") || ParsePrefix(command, "W")) next_write = true;
+
+            /* Allow optional "0x" prefix. */
+            ParsePrefix(command, "0x");
+
+            /* Decode address. */
+            u64 next_address = DecodeHex(command);
+            {
+                std::scoped_lock lk(g_watch_data_lock);
+                m_watch_data.next_read = next_read;
+                m_watch_data.next_write = next_write;
+                m_watch_data.next_address = next_address;
+                clearw();
+                m_watch_data.address = m_watch_data.next_address;
+                m_watch_data.read = m_watch_data.next_read;
+                m_watch_data.write = m_watch_data.next_write;
+                setw();
+            }
+
         } else if (ParsePrefix(command, "get mapping ")) {
             if (!this->HasDebugProcess()) {
                 AppendReplyFormat(reply_cur, reply_end, "Not attached.\n");
@@ -2288,6 +4858,27 @@ namespace ams::dmnt {
 
             /* If doing a fresh read, generate the process list. */
             if (offset == 0 || g_annex_buffer_contents != AnnexBufferContents_Processes) {
+                /* If GDB is not yet attached, note the cheat process so it appears in the list. */
+                os::ProcessId cheat_process_id = os::InvalidProcessId;
+                char cheat_process_name[12] = "";
+                if (offset == 0 && !m_debug_process.IsValid()) {
+                    cheat_process_id = dmnt::dbg::GetSharedProcessId();
+                    if (cheat_process_id != os::InvalidProcessId) {
+                        dmnt::dbg::GetSharedProcessName(cheat_process_name);
+                        if (cheat_process_name[0] == '\0') {
+                            std::strncpy(cheat_process_name, "Application", sizeof(cheat_process_name));
+                        }
+                        /* Note: we deliberately do NOT close the cheat process
+                         * here. This path only builds the process list for
+                         * qXfer:osdata:processes -- a client may list processes
+                         * without ever attaching, and tearing down the user's
+                         * cheats as a side effect of listing is wrong.
+                         * DebugProcess::Attach() closes it when we actually
+                         * attach, and re-opens it once our initial debug events
+                         * have been consumed. */
+                    }
+                }
+
                 /* Prepare to write to annex buffer. */
                 char *dst_cur = g_annex_buffer;
                 char *dst_end = g_annex_buffer + sizeof(g_annex_buffer);
@@ -2303,20 +4894,36 @@ namespace ams::dmnt {
                     /* Get all process ids. */
                     u64 process_ids[0x50];
                     s32 num_process_ids;
-                    R_ABORT_UNLESS(svc::GetProcessList(std::addressof(num_process_ids), process_ids, util::size(process_ids)));
+                    if (R_FAILED(svc::GetProcessList(std::addressof(num_process_ids), process_ids, util::size(process_ids)))) {
+                        num_process_ids = 0;
+                    }
 
                     /* Send all processes. */
                     for (s32 i = 0; i < num_process_ids; ++i) {
+                        if (process_ids[i] == dmnt::dbg::GetSharedProcessId().value) {
+                            char name[12] = "";
+                            dmnt::dbg::GetSharedProcessName(name);
+                            if (name[0] == '\0') {
+                                std::strncpy(name, "Application", sizeof(name));
+                            }
+                            AppendReplyFormat(dst_cur, dst_end, "<item>\n<column name=\"pid\">%lu</column>\n<column name=\"command\">%s</column>\n</item>\n", process_ids[i], name);
+                            continue;
+                        }
+
                         svc::Handle handle;
                         if (R_SUCCEEDED(svc::DebugActiveProcess(std::addressof(handle), process_ids[i]))) {
-                            ON_SCOPE_EXIT { R_ABORT_UNLESS(svc::CloseHandle(handle)); };
+                            ON_SCOPE_EXIT { static_cast<void>(svc::CloseHandle(handle)); };
 
                             /* Get the create process event. */
                             svc::DebugEventInfo d;
-                            R_ABORT_UNLESS(svc::GetDebugEvent(std::addressof(d), handle));
-                            AMS_ABORT_UNLESS(d.type == svc::DebugEvent_CreateProcess);
+                            if (R_FAILED(svc::GetDebugEvent(std::addressof(d), handle)) || d.type != svc::DebugEvent_CreateProcess) {
+                                continue;
+                            }
 
                             AppendReplyFormat(dst_cur, dst_end, "<item>\n<column name=\"pid\">%lu</column>\n<column name=\"command\">%s</column>\n</item>\n", d.info.create_process.process_id, d.info.create_process.name);
+                        } else if (process_ids[i] == cheat_process_id.value) {
+                            /* Fallback if the kernel is still detaching. */
+                            AppendReplyFormat(dst_cur, dst_end, "<item>\n<column name=\"pid\">%lu</column>\n<column name=\"command\">%s</column>\n</item>\n", process_ids[i], cheat_process_name);
                         }
                     }
                 }
@@ -2419,8 +5026,7 @@ namespace ams::dmnt {
 
         return true;
     }
-
-    void GdbServerImpl::z() {
+    void GdbServerImpl::z() { // remove_breakpoint
         /* Increment past the 'z'. */
         ++m_receive_packet;
 

@@ -64,7 +64,13 @@ namespace ams::dmnt {
 
         /* Validate. */
         if (size <= 8) {
-            /* Check that address is aligned. */
+            /* Check that address does not straddle a qword boundary.
+             * The DBGWCR `BAS` field is 8 bits within a single aligned
+             * qword; a watch that crosses the boundary would only fire
+             * for the lower half. The original Atmosphere check was
+             * disabled in the fork (see design doc Bug 13); we restore
+             * it here so callers get an explicit failure instead of a
+             * silently-half-armed watchpoint. */
             if (util::AlignDown(address, 8) != util::AlignDown(address + size - 1, 8)) {
                 AMS_DMNT2_GDB_LOG_ERROR("HardwareWatchPointManager::IsValidWatchPoint(%lx, %lx) FAIL range crosses qword boundary\n", address, size);
                 return false;
@@ -129,8 +135,26 @@ namespace ams::dmnt {
         }
     }
 
+    size_t HardwareWatchPointManager::GetUsableWatchPointCount() {
+        /* Only hand out watchpoint registers the CPU actually has.
+         *
+         * The pool is BreakPointCountMax (0x10) entries but the Switch's
+         * Cortex-A57 has four (D0-D3). Handing out D4+ meant SetWatchPoint
+         * failed deep inside the SVC instead of reporting "out of watchpoints"
+         * at the manager, which is what a caller can act on.
+         * See WATCHPOINT_BUG.md, Finding B. */
+        int last_bp = -1, first_ctx = -1, last_ctx = -1, last_wp = -1;
+        HardwareBreakPointManager::GetRegisterExtents(std::addressof(last_bp), std::addressof(first_ctx), std::addressof(last_ctx), std::addressof(last_wp));
+
+        if (last_wp < 0) {
+            return 0;
+        }
+
+        return std::min<size_t>(static_cast<size_t>(last_wp) + 1, BreakPointCountMax);
+    }
+
     BreakPointBase *HardwareWatchPointManager::GetBreakPoint(size_t index) {
-        if (index < util::size(m_breakpoints)) {
+        if (index < GetUsableWatchPointCount()) {
             return m_breakpoints + index;
         } else {
             return nullptr;
@@ -138,6 +162,12 @@ namespace ams::dmnt {
     }
 
     Result HardwareWatchPointManager::SetWatchPoint(u64 address, u64 size, bool read, bool write) {
+        /* One watchpoint per address: copies pile up in the debug registers and a
+         * hit only clears one of them. */
+        if (this->HasBreakPoint(address)) {
+            R_SUCCEED();
+        }
+
         /* Get a free watchpoint. */
         auto *bp = static_cast<WatchPoint *>(this->GetFreeBreakPoint());
         R_UNLESS(bp != nullptr, svc::ResultOutOfHandles());

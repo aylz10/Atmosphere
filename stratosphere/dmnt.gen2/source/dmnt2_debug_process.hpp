@@ -154,6 +154,10 @@ namespace ams::dmnt {
             Result Step();
             Result Step(u64 thread_id);
             void ClearStep();
+            bool IsStepping() const { return m_stepping; }
+            /* The temporary breakpoints STEPOVER puts after a call. ClearStep only
+             * clears them while single-stepping, which a step over a call isn't. */
+            void ClearStepBreakPoints() { m_step_breakpoints.ClearStep(); }
 
             Result Break();
 
@@ -161,6 +165,8 @@ namespace ams::dmnt {
 
             Result SetBreakPoint(uintptr_t address, size_t size, bool is_step);
             Result ClearBreakPoint(uintptr_t address, size_t size);
+            bool HasSoftwareBreakPoint(uintptr_t address) { return m_software_breakpoints.HasBreakPoint(address); }
+            u32 GetSoftwareBreakPointOriginalInstruction(uintptr_t address) { return m_software_breakpoints.GetOriginalInstruction(address); }
 
             Result SetHardwareBreakPoint(uintptr_t address, size_t size, bool is_step);
             Result ClearHardwareBreakPoint(uintptr_t address, size_t size);
@@ -182,6 +188,7 @@ namespace ams::dmnt {
             void GetThreadName(char *dst, u64 thread_id) const;
         private:
             Result Start();
+            Result StartShared(os::ProcessId process_id);
 
             void CollectProcessInfo();
 
